@@ -19,9 +19,11 @@ MC & S CoWorker v3 is an **AI accounting practice automation platform** built as
 |-------|-------------|
 | 0 | Droplet provisioned & hardened (Ubuntu 24.04, Postgres 16 + pgvector, Redis 7, Caddy, ufw, systemd) |
 | 1 | Repo structure, FastAPI skeleton at `coworker.api.main:app`, `/health` endpoint, Alembic, deploy script, age-encrypted env, Caddy reverse proxy, `coworker-api.service` running |
-| 2 | Multi-tenant data model (`firms`, `users` tables), envelope encryption (`EnvelopeCipher`), hash-chained audit log (`audit_log` + `append_audit` + `verify_chain`), Presidio PII scrubber for AU TFN/ABN/Medicare/DL, RLS helpers (`with_firm_scope`), MS OAuth 2.0 PKCE routes scaffolded |
+| 2 | Phase 2 — completion pending audit fixes (see docs/audits/2026-05-01-pre-phase-3-audit.md). Primitives in place (encryption, audit log, PII scrubber, MS OAuth scaffolding) but gaps require Stages A–E to close before Phase 3 begins. |
 
-**Currently working on:** Pre-Phase-3 audit and consolidation. Phase 3 (External Service Connectors) is next.
+The pre-Phase-3 audit identified seven listed gaps and 18 additional issues spanning critical (committed master key), high (missing RLS policies, broken get_session, stale model strings), and medium/low severity items. These are being worked through systematically in Stages A–E. Stage A (dependency and configuration prerequisites) is in progress.
+
+**Currently working on:** Stage A–E audit fixes per docs/audits/2026-05-01-pre-phase-3-audit.md. Phase 3 (External Service Connectors) begins after audit fixes are complete and verified.
 
 ## Known gaps from Phase 2 that must be closed before Phase 3 begins
 
