@@ -23,7 +23,7 @@ MC & S CoWorker v3 is an **AI accounting practice automation platform** built as
 
 The pre-Phase-3 audit identified seven listed gaps and 18 additional issues spanning critical (committed master key), high (missing RLS policies, broken get_session, stale model strings), and medium/low severity items. These are being worked through systematically in Stages A–E. Stage A (dependency and configuration prerequisites) is in progress.
 
-**Currently working on:** Stage A–E audit fixes per docs/audits/2026-05-01-pre-phase-3-audit.md. Phase 3 (External Service Connectors) begins after audit fixes are complete and verified.
+**Currently working on:** Stage B2 (test infrastructure and DB session fixes) per docs/audits/2026-05-01-pre-phase-3-audit.md. Phase 3 (External Service Connectors) begins after audit fixes are complete and verified.
 
 ## Known gaps from Phase 2 that must be closed before Phase 3 begins
 
