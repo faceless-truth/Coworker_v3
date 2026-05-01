@@ -1,5 +1,4 @@
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from functools import lru_cache
 from typing import Any
 
@@ -56,12 +55,12 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module 'coworker.db.session' has no attribute {name!r}")
 
 
-@asynccontextmanager
 async def get_session() -> AsyncIterator[AsyncSession]:
+    """FastAPI dependency yielding an AsyncSession.
+
+    Bare async-generator pattern (no @asynccontextmanager) so it works
+    correctly with `Depends(get_session)`. Callers must commit explicitly;
+    the surrounding `async with` only handles close/rollback on exception.
+    """
     async with get_sessionmaker()() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+        yield session
