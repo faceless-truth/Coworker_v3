@@ -58,7 +58,7 @@ These are NOT optional. Phase 3 builds connectors that depend on credentials bei
 ### Database
 
 - **Every domain table has `firm_id` with FK to `firms.id` and an index.** No exceptions.
-- **RLS policies on every tenant-scoped table.** Use `with_firm_scope` to set `coworker.current_firm_id` at the start of every request handler's session.
+- **RLS policies on every tenant-scoped table, plus `FORCE ROW LEVEL SECURITY`** so the application role (which owns the tables) is also subject to them. Use `firm_context(firm_id)` (from `coworker.db.session`) at the start of every request handler's transaction; the SQLAlchemy `after_begin` listener applies it as the `app.firm_id` GUC automatically. See **Row-Level Security strategy** below.
 - **Migrations are forward-only.** Each migration is small enough to be reviewable. Use Alembic.
 - **Never store raw TFNs.** Hash them or store last-4 only.
 - **Encrypt all credentials at rest** with `EnvelopeCipher` and `associated_data=firm_id`.
@@ -67,6 +67,37 @@ These are NOT optional. Phase 3 builds connectors that depend on credentials bei
 
 - **`firm_id` is in every query.** If you forget, RLS catches you, but the application code should still always filter explicitly.
 - **No global state that crosses firms.** No singleton clients holding firm-specific tokens. Every connector is constructed per-firm.
+
+### Row-Level Security strategy
+
+Tenant isolation is enforced at the **database layer**, not just by application-level filters. This is defence-in-depth: forgetting a `WHERE firm_id = ?` in application code does not produce a cross-tenant read.
+
+**Mechanism.** The Phase 2.1 migration enables `FORCE ROW LEVEL SECURITY` on every tenant-scoped table (`firms`, `users`, `audit_log`) and creates four policies per table — one each for SELECT, INSERT, UPDATE, DELETE — that filter on `NULLIF(current_setting('app.firm_id', true), '')::uuid`. `FORCE` is required because the application role (`coworker`) owns these tables and would otherwise bypass RLS as the owner. `NULLIF(..., '')` is required because once a custom GUC has been touched on a connection, both `SET LOCAL` post-COMMIT and `RESET app.firm_id` leave it at empty string rather than NULL — and `''::uuid` would raise on every subsequent transaction without a firm context.
+
+**Setting the firm context.** Application code declares the firm scope of a transaction by entering an `async with firm_context(firm_id):` block before the first DB operation. `firm_context` is a `ContextVar`-based async context manager defined in `coworker.db.session`. A SQLAlchemy `after_begin` listener registered on the synchronous `Session` class reads the contextvar at transaction start and issues `SELECT set_config('app.firm_id', :firm_id, true)` (transaction-scoped) so all subsequent queries in that transaction are subject to RLS scoped to that firm.
+
+In a FastAPI route, the pattern is:
+
+```python
+from coworker.db.session import firm_context, get_session
+
+@router.get("/...")
+async def handler(firm_id: UUID, session: AsyncSession = Depends(get_session)):
+    async with firm_context(firm_id):
+        # all queries on `session` inside this block are RLS-scoped to firm_id
+        return await session.execute(...)
+```
+
+**Secure-by-default.** If a code path forgets to enter `firm_context`, the listener does nothing, the GUC stays unset (or empty), every RLS predicate evaluates to NULL, and queries return zero rows — not every row. That is the property that makes "forgot to set the firm context" a 0-row response rather than a data leak.
+
+**Pool-reuse failure mode.** Connections returned to the pool retain any session-level state set without `LOCAL`. The engine has a `checkin` event handler (`_attach_pool_listeners` in `coworker.db.session`) that issues `RESET app.firm_id` when a connection returns to the pool, so a future buggy code path using `set_config(..., is_local=false)` cannot leak firm context across requests. `backend/tests/integration/test_rls.py::test_rls_pool_reuse_does_not_leak_firm_context` actively verifies this: on a `pool_size=1, max_overflow=0` engine, session 1 deliberately leaks a session-level GUC, then session 2 (no firm_context) is asserted to see zero rows.
+
+**Operational notes.**
+
+- **Migrations** run as the `coworker` role; DDL is not subject to RLS. The Phase 2.1 migration acquires `ACCESS EXCLUSIVE` locks via `ALTER TABLE`, so don't run it against a busy DB.
+- **Tests that need to seed cross-firm data** use the `ALTER TABLE ... NO FORCE / INSERT / FORCE` bracket inside a single transaction to bypass RLS for setup as the table owner. See `_seed_two_firms` in `test_rls.py`. (A Postgres superuser or a role with `BYPASSRLS` would also bypass; local dev does not have a superuser password and we deliberately do NOT grant `BYPASSRLS` to `coworker`.)
+- **Backups and break-glass admin maintenance** should use a Postgres superuser or a role with `BYPASSRLS`. The `coworker` application role is intentionally not granted `BYPASSRLS`.
+- **Raw SQL via psql as `coworker`:** to inspect tenant tables, set the GUC manually first, e.g. `SET app.firm_id = '<uuid>';`. Without it, `SELECT * FROM firms` returns zero rows.
 
 ### Security
 
