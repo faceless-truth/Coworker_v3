@@ -275,3 +275,19 @@ The `coworker` role needs CREATEDB to let the test fixture create
 Stage B1 missed this; corrected mid-Stage-B2 and documented in
 `backend/tests/conftest.py`. If you're setting up a fresh WSL/dev
 environment, run the ALTER ROLE before running the test suite.
+
+### pgvector trust flag (local dev + droplet)
+
+The extensions migration (`a1b2c3d4e5f6_create_extensions.py`) runs
+`CREATE EXTENSION vector` as the application role, which is not a
+superuser. pgvector is not trusted by default, so this requires a
+one-time host setup step performed as root:
+
+    sudo sed -i 's/^trusted = false/trusted = true/' \
+      /usr/share/postgresql/16/extension/vector.control
+
+(adjust the major version path if running PostgreSQL ≠ 16). Without
+this, `alembic upgrade head` on a fresh database fails with
+"permission denied to create extension vector". `pg_trgm` and
+`pgcrypto` are trusted by default in PostgreSQL 13+ and need no
+host changes.
