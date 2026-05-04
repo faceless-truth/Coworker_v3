@@ -47,6 +47,7 @@ cd backend
 | Phase | Description | Status |
 | :--- | :--- | :--- |
 | 0 | Droplet provisioning & hardening | ✅ Complete |
-| 1 | Server skeleton & database foundation | 🔄 In Progress |
-| 2 | Identity, tenancy & security foundations | ⏳ Pending |
-| 3–16 | ... | ⏳ Pending |
+| 1 | Server skeleton & database foundation | ✅ Complete |
+| 2 | Identity, tenancy & security foundations | ✅ Complete (Stages A, B1, B2, C1 of pre-Phase-3 audit complete; C2 in progress) |
+| 3 | External service connectors | ⏭️ Next |
+| 4–16 | ... | ⏳ Pending |
