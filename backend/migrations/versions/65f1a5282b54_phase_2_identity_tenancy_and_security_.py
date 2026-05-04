@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
@@ -46,7 +47,7 @@ def upgrade() -> None:
         sa.Column('sharepoint_site_id', sa.String(length=200), nullable=True),
         sa.Column('sharepoint_clients_drive_id', sa.String(length=200), nullable=True),
         sa.Column('sharepoint_clients_folder_path', sa.String(length=500), nullable=False),
-        sa.Column('settings', sa.JSON(), nullable=False),
+        sa.Column('settings', postgresql.JSONB(), nullable=False),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
         sa.Column('updated_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
         sa.PrimaryKeyConstraint('id'),
@@ -69,7 +70,7 @@ def upgrade() -> None:
         sa.Column('monitored_mailbox', sa.String(length=200), nullable=True),
         sa.Column('is_active_processor', sa.Boolean(), nullable=False),
         sa.Column('is_reception_mode', sa.Boolean(), nullable=False),
-        sa.Column('style_profile', sa.JSON(), nullable=True),
+        sa.Column('style_profile', postgresql.JSONB(), nullable=True),
         sa.Column('style_profile_updated_at', sa.DateTime(timezone=True), nullable=True),
         sa.Column('last_login_at', sa.DateTime(timezone=True), nullable=True),
         sa.Column('created_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
@@ -93,7 +94,7 @@ def upgrade() -> None:
         sa.Column('action', sa.String(length=100), nullable=False),
         sa.Column('target_type', sa.String(length=50), nullable=True),
         sa.Column('target_id', sa.String(length=200), nullable=True),
-        sa.Column('payload', sa.JSON(), nullable=False),
+        sa.Column('payload', postgresql.JSONB(), nullable=False),
         sa.Column('prev_hash', sa.String(length=64), nullable=False),
         sa.Column('entry_hash', sa.String(length=64), nullable=False),
         sa.ForeignKeyConstraint(['firm_id'], ['firms.id'], ),
