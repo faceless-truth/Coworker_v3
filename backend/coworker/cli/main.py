@@ -1,7 +1,7 @@
 import uuid
 
 import click
-from sqlalchemy import select, text
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -146,25 +146,30 @@ async def _bootstrap_firm(
 ) -> uuid.UUID:
     """UPSERT a firm by slug. Returns the firm's UUID. Caller commits.
 
-    Lifts FORCE ROW LEVEL SECURITY on `firms` for the duration of the
-    upsert because we don't know the firm's id ahead of the slug
-    lookup, and a SELECT under FORCE+RLS without app.firm_id matching
-    the row would return zero rows. The `coworker` role owns `firms`
-    so it can ALTER TABLE; FORCE is restored in the same transaction
-    in the finally block, so on commit the table state is unchanged.
+    The lookup uses `lookup_firm_by_slug`, which lifts FORCE RLS on
+    `firms` only for its SELECT. We then commit (closing that
+    transaction) and do the INSERT/UPDATE in a fresh transaction under
+    `firm_context(firm_id)` — the per-row INSERT/UPDATE policies pass
+    because app.firm_id matches the row's id. This keeps RLS bypass
+    narrowly scoped to the slug-to-id resolution step.
     """
+    from coworker.db.firms import lookup_firm_by_slug
     from coworker.db.models.tenancy import Firm
+    from coworker.db.session import firm_context
     from coworker.security.encryption import encrypt_str
 
-    await session.execute(text("ALTER TABLE firms NO FORCE ROW LEVEL SECURITY"))
-    try:
-        existing = (
-            await session.execute(select(Firm).where(Firm.slug == slug))
-        ).scalar_one_or_none()
+    existing = await lookup_firm_by_slug(session, slug)
+    is_new = existing is None
+    firm_id = uuid.uuid4() if is_new else existing.id  # type: ignore[union-attr]
+    ciphertext = encrypt_str(azure_client_secret, firm_id=str(firm_id))
 
-        if existing is None:
-            firm_id = uuid.uuid4()
-            ciphertext = encrypt_str(azure_client_secret, firm_id=str(firm_id))
+    # Close the lookup's transaction so the next execute (INSERT/UPDATE)
+    # opens a fresh one under firm_context — that's the only way the
+    # after_begin listener can apply app.firm_id for the per-row policy.
+    await session.commit()
+
+    async with firm_context(firm_id):
+        if is_new:
             session.add(
                 Firm(
                     id=firm_id,
@@ -177,14 +182,15 @@ async def _bootstrap_firm(
                     azure_client_secret_ciphertext=ciphertext,
                 )
             )
-            await session.flush()
-            return firm_id
-
-        ciphertext = encrypt_str(azure_client_secret, firm_id=str(existing.id))
-        existing.azure_tenant_id = azure_tenant_id
-        existing.azure_client_id = azure_client_id
-        existing.azure_client_secret_ciphertext = ciphertext
+        else:
+            await session.execute(
+                update(Firm)
+                .where(Firm.id == firm_id)
+                .values(
+                    azure_tenant_id=azure_tenant_id,
+                    azure_client_id=azure_client_id,
+                    azure_client_secret_ciphertext=ciphertext,
+                )
+            )
         await session.flush()
-        return existing.id
-    finally:
-        await session.execute(text("ALTER TABLE firms FORCE ROW LEVEL SECURITY"))
+    return firm_id

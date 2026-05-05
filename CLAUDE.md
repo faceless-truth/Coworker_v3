@@ -107,6 +107,16 @@ async def handler(firm_id: UUID, session: AsyncSession = Depends(get_session)):
 - **Never hardcode model strings.** Read from `Settings.ANTHROPIC_MODEL_DEFAULT` / `_REASONING` / `_FAST`.
 - **Never log secrets.** The Loguru patcher should redact known secret patterns. Be careful with new patterns.
 
+#### Audit log vs Loguru — what goes where
+
+The audit log records *actions that affected a specific firm's data*. Every entry has `firm_id NOT NULL` with a FK to `firms.id`, and entries are linked into a hash chain anchored on the firm. That means events that never reached a firm — invalid OAuth state tokens, malformed callbacks where we couldn't resolve a firm, sign-in attempts against a slug that doesn't exist — *cannot* be appended; the schema actively prevents it. Those events go to **Loguru** with structured fields (`reason`, `remote_ip`, `user_agent`) so they remain observable for ops monitoring and rate-limiting (Phase 14) without polluting the audit chain. Both are observable; only one is anchored in the chain. The chain's integrity is preserved because we never write to it without a firm context.
+
+Concretely: in `auth.callback`, `invalid_state` and `firm_not_found` go to Loguru (no firm_id available); `token_exchange_failed`, `user_creation_failed`, and `azure_object_id_conflict` go to `append_audit` (firm_id known). Successful sign-in goes to `append_audit` with `action="auth.callback.success"`. The user-facing HTTP response is the same generic `400 authentication failed` regardless of which internal reason fired — the *internal* reason distinguishes the failure for logs/audit, the *external* response does not, so we don't leak whether a slug ever existed.
+
+#### Known schema notes
+
+- **`users.azure_object_id` is globally UNIQUE**, not composite-unique on `(firm_id, azure_object_id)`. The OAuth callback selects users by oid only and relies on RLS to scope the SELECT to the current firm. The cross-firm collision case (a Microsoft user joins a second firm) is rejected at INSERT with an `IntegrityError` and surfaces as HTTP 409. The eventual fix is a Phase-3-or-later migration that drops the global UNIQUE and replaces it with `UNIQUE(firm_id, azure_object_id)`. That migration also needs to update the OAuth callback's lookup to `WHERE firm_id = ? AND azure_object_id = ?`. Documented here so the apparent inconsistency between the spec ("UPSERT keyed by (firm_id, oid)") and the schema (global UNIQUE) is not mysterious in six months.
+
 ### Tests
 
 - **Tests live in `backend/tests/`.** `unit/` for pure-Python tests, `integration/` for tests that touch Postgres/Redis.
