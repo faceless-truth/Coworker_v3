@@ -3,12 +3,17 @@ import sys
 from loguru import logger
 
 from coworker.config import get_settings
+from coworker.loguru_patcher import redact_secrets
 
 
 def setup_logging() -> None:
     """Configure structured JSON logging to stdout for systemd capture."""
     settings = get_settings()
     logger.remove()
+    # Register the secret-redaction patcher BEFORE adding sinks so every
+    # emitted record passes through it. configure(patcher=...) does not
+    # touch existing handlers; only patcher / extra / etc. are reset.
+    logger.configure(patcher=redact_secrets)
     logger.add(
         sys.stdout,
         level=settings.LOG_LEVEL,
