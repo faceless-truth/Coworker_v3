@@ -7,14 +7,21 @@ for patcher callables.
 
 Match strategy
 --------------
-Case-insensitive *substring* match against a fixed list of patterns.
-A key is redacted if any pattern in _SENSITIVE_PATTERNS appears
-anywhere in key.lower(). The substring approach is deliberately broad:
-it catches present forms ("refresh_token") and future variations
-("ms_refresh_token", "azure_client_secret") without having to maintain
-an exhaustive enumeration. Over-redaction is acceptable here — a
-redacted "status_code" or "token_type" in a log line is a minor
-annoyance; an un-redacted "refresh_token" is a security incident.
+Exact case-insensitive key match against PATTERNS (a frozenset of
+lowercase strings). A key is redacted iff key.lower() is in PATTERNS.
+The clarity is the feature: there is no possibility of unexpectedly
+redacting `status_code`, `error_code`, or `country_code` because they
+share a substring with a sensitive name. The trade-off is that the
+pattern list must enumerate every name we want to redact, including
+variants — when a new field is added that needs redaction, add it
+here.
+
+PATTERNS includes both generic OAuth/auth field names (client_secret,
+refresh_token, etc.) and the specific column/argument names this
+codebase uses (azure_client_secret, ms_refresh_token_ciphertext,
+etc.). The *_ciphertext entries are defensive: there is no legitimate
+reason to log encrypted bytes, and including them removes one more
+class of mistake from the worry budget.
 
 Recursion
 ---------
@@ -31,22 +38,31 @@ from typing import Any
 
 _REDACTED = "[REDACTED]"
 
-_SENSITIVE_PATTERNS: tuple[str, ...] = (
-    "client_secret",
-    "refresh_token",
-    "access_token",
-    "id_token",
-    "code_verifier",
-    "password",
-    "token",
-    "secret",
-    "code",
+PATTERNS: frozenset[str] = frozenset(
+    {
+        # Generic OAuth / auth field names
+        "client_secret",
+        "refresh_token",
+        "access_token",
+        "id_token",
+        "code",
+        "code_verifier",
+        "password",
+        "token",
+        "secret",
+        # Field names this codebase actually uses
+        "azure_client_secret",
+        "azure_client_secret_ciphertext",
+        "ms_access_token_ciphertext",
+        "ms_refresh_token_ciphertext",
+        "session_jwt_secret",
+        "master_encryption_key",
+    }
 )
 
 
 def _is_sensitive(key: str) -> bool:
-    k = key.lower()
-    return any(p in k for p in _SENSITIVE_PATTERNS)
+    return key.lower() in PATTERNS
 
 
 def _scrub(value: Any) -> Any:
@@ -67,7 +83,7 @@ def _scrub(value: Any) -> Any:
 
 def redact_secrets(record: dict[str, Any]) -> None:
     """Loguru patcher. Mutates record["extra"] in place to redact
-    sensitive values keyed by names matching _SENSITIVE_PATTERNS."""
+    sensitive values keyed by names in PATTERNS (case-insensitive)."""
     extras = record.get("extra")
     if not isinstance(extras, dict):
         return

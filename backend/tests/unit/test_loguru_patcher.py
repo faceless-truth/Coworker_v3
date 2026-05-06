@@ -91,19 +91,49 @@ def test_deeply_nested_structure() -> None:
     assert deep[1]["benign"] == "fine"
 
 
-def test_substring_match_catches_prefixed_variants() -> None:
-    """ms_refresh_token, azure_client_secret etc. should be redacted."""
+def test_status_code_is_not_redacted() -> None:
+    """Common HTTP status_code field must not be over-redacted just
+    because the substring 'code' appears — under exact match it is
+    only redacted if its full key matches a PATTERNS entry."""
+    record = {"extra": {"status_code": 200, "method": "POST"}}
+    redact_secrets(record)
+    assert record["extra"]["status_code"] == 200
+    assert record["extra"]["method"] == "POST"
+
+
+def test_error_code_is_not_redacted() -> None:
+    """OAuth error responses include 'error_code' fields that are
+    diagnostic, not sensitive — they identify failure classes
+    (invalid_grant, invalid_request, etc.)."""
+    record = {"extra": {"error_code": "invalid_grant", "error_description": "..."}}
+    redact_secrets(record)
+    assert record["extra"]["error_code"] == "invalid_grant"
+    assert record["extra"]["error_description"] == "..."
+
+
+def test_codebase_specific_patterns_are_redacted() -> None:
+    """The PATTERNS frozenset includes the actual column / argument
+    names this codebase uses. Logging an entire User row or a
+    decrypted-credential dict must redact these keys explicitly."""
     record = {
         "extra": {
-            "ms_refresh_token": "leak",
-            "azure_client_secret": "leak",
-            "user_password": "leak",
+            "azure_client_secret": "abc",
+            "azure_client_secret_ciphertext": b"\x00\x01\x02",
+            "ms_access_token_ciphertext": b"\xde\xad\xbe\xef",
+            "ms_refresh_token_ciphertext": b"\x00" * 64,
+            "session_jwt_secret": "shh",
+            "master_encryption_key": "mk",
+            "firm_id": "f-1",  # not sensitive — keep it
         }
     }
     redact_secrets(record)
-    assert record["extra"]["ms_refresh_token"] == "[REDACTED]"
     assert record["extra"]["azure_client_secret"] == "[REDACTED]"
-    assert record["extra"]["user_password"] == "[REDACTED]"
+    assert record["extra"]["azure_client_secret_ciphertext"] == "[REDACTED]"
+    assert record["extra"]["ms_access_token_ciphertext"] == "[REDACTED]"
+    assert record["extra"]["ms_refresh_token_ciphertext"] == "[REDACTED]"
+    assert record["extra"]["session_jwt_secret"] == "[REDACTED]"
+    assert record["extra"]["master_encryption_key"] == "[REDACTED]"
+    assert record["extra"]["firm_id"] == "f-1"
 
 
 def test_record_without_extra_does_not_crash() -> None:
