@@ -1,6 +1,6 @@
-import re
 import uuid
 from dataclasses import dataclass
+from typing import Any
 
 from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
 from presidio_analyzer.nlp_engine import NlpEngineProvider
@@ -56,12 +56,47 @@ class PIIScrubber:
             "IBAN_CODE", "DATE_TIME", "PERSON",
         ]
         results = self.analyzer.analyze(text=text, language="en", entities=entities)
+        # Recognisers can produce overlapping hits — Presidio's
+        # generic PHONE_NUMBER often co-fires with our AU_ABN /
+        # AU_MEDICARE patterns on the same span, and PERSON can
+        # cover the same offsets as EMAIL_ADDRESS. Replacing
+        # overlapping hits naively (end-to-start) corrupts the
+        # output: a later replacement lands inside an earlier one,
+        # leaving a mangled tail like `]a3a]` past the placeholder.
+        # Resolve by keeping the highest-confidence non-overlapping
+        # spans first and discarding any later span that overlaps
+        # one we've already accepted.
+        accepted = _select_non_overlapping(results)
         mapping: dict[str, str] = {}
         scrubbed = text
-        # Replace from end to start to preserve offsets
-        for r in sorted(results, key=lambda x: x.start, reverse=True):
+        # Replace from end to start to preserve offsets.
+        for r in sorted(accepted, key=lambda x: x.start, reverse=True):
             placeholder = f"[{r.entity_type}_{uuid.uuid4().hex[:6]}]"
             original = scrubbed[r.start:r.end]
             mapping[placeholder] = original
             scrubbed = scrubbed[:r.start] + placeholder + scrubbed[r.end:]
         return ScrubResult(text=scrubbed, mapping=mapping)
+
+
+def _select_non_overlapping(results: list[Any]) -> list[Any]:
+    """Greedy non-overlapping selection by descending confidence.
+
+    Sort recogniser results by score (highest first), then by length
+    (longer first, so a 9-digit TFN wins over an 8-digit substring).
+    Walk in order and keep each span only if it does not overlap any
+    previously kept span.
+    """
+    by_priority = sorted(
+        results,
+        key=lambda r: (r.score, r.end - r.start),
+        reverse=True,
+    )
+    accepted: list[Any] = []
+    for r in by_priority:
+        if not any(_overlaps(r, k) for k in accepted):
+            accepted.append(r)
+    return accepted
+
+
+def _overlaps(a: Any, b: Any) -> bool:
+    return bool(a.start < b.end and b.start < a.end)
