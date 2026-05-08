@@ -107,7 +107,28 @@ Time estimates are deliberately omitted. Estimates corrode into deadlines and de
 
 The two manual verifications need a real Microsoft tenant and live OAuth flow — they're checklist items for Elio, not automated tests.
 
-### 3B. Anthropic connector (highest blast radius — build first after 3A)
+### 3B. Anthropic connector ✅ COMPLETE
+
+Closed 2026-05-08. Five commits:
+
+| # | Commit | Tests added |
+|---|--------|-------------|
+| 3B-1 | AnthropicClient skeleton + complete + connector taxonomy | 11 |
+| 3B-2 | PII black-box test + dedupe overlapping spans | 6 |
+| 3B-3 | count_tokens | 4 |
+| 3B-4 | Redis token meter wired into complete() | 11 |
+| 3B-5 | extended-thinking opt-in | 4 |
+
+Plus a refactor commit `48ae764` moving the connector exception taxonomy from `coworker.graph.exceptions` to `coworker.connectors.exceptions` (the canonical home), and a fix commit `4a22f75` tightening `graph/auth.py` under mypy --strict.
+
+121 tests on main. The PII black-box guarantee — no AU TFN/ABN/Medicare digits ever leave the process to Anthropic — is now load-bearing-tested. Token usage is recorded per firm/model/day in Redis.
+
+Key technical decisions in 3B:
+- **PIIScrubber overlap dedupe**: Presidio's PHONE_NUMBER often co-fires with our AU_ABN on the same span. Naive end-to-start replacement corrupted the output. Now: greedy non-overlapping selection by descending confidence + length. Highest-confidence span wins. Means an 11-digit ABN today gets tagged `[PHONE_NUMBER_xxx]` (Presidio score 0.85) rather than `[AU_ABN_xxx]` (our score 0.6) — both satisfy the security goal. Recogniser confidence tuning to make AU patterns dominate is a Phase 4 concern when we have a real corpus to tune against.
+- **Token meter optional in constructor**: `token_meter=None` skips recording. Production wiring (Phase 5 orchestrator) constructs every AnthropicClient with a TokenMeter; tests pass None. The architecture's "every Anthropic call meters tokens" guarantee is therefore enforced by the orchestrator construction site, not by this constructor.
+- **embed() not on AnthropicClient**: deferred to the Phase 4 embedder abstraction (Voyage / OpenAI), per arch §4.2. Anthropic doesn't offer embeddings.
+
+### 3B. Anthropic connector (original plan, archived)
 
 Why first: every connector after this one calls Claude. Specialists, classifiers, hybrid-rerank, vision — all gated on this. Ship it now with PII scrubbing and metering, downstream code stops reinventing.
 
