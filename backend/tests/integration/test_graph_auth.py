@@ -507,3 +507,102 @@ def test_refresh_user_firm_mismatch_raises_runtime_error(
                 await refresh_access_token(session, user_a, firm_b)
 
     asyncio.run(_run())
+
+
+def test_refresh_user_without_refresh_token_raises_auth_error(
+    graph_auth_environment,
+) -> None:
+    """A user row with NULL ms_refresh_token_ciphertext fails fast.
+
+    The columns are nullable but the OAuth callback always populates
+    them; this defends against a partial-onboarding row reaching the
+    refresh path. ConnectorAuthError surfaces "sign in again" cleanly
+    rather than the AttributeError the caller would otherwise get.
+    """
+    sessionmaker = graph_auth_environment["sessionmaker"]
+    created = graph_auth_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed_firm_and_user(
+        sessionmaker,
+        slug=f"graph-norefresh-{uuid.uuid4().hex[:8]}",
+        tenant_id=str(uuid.uuid4()),
+        client_id=str(uuid.uuid4()),
+        client_secret_plain="firm-secret",
+        refresh_token_plain="placeholder",
+    )
+    created.append(firm_id)
+
+    # Wipe the refresh-token ciphertext to simulate an inconsistent row.
+    async def _clear_refresh_token() -> None:
+        async with sessionmaker() as session, firm_context(firm_id):
+            user = (
+                await session.execute(select(User).where(User.id == user_id))
+            ).scalar_one()
+            user.ms_refresh_token_ciphertext = None
+            await session.commit()
+
+    asyncio.run(_clear_refresh_token())
+
+    async def _run() -> None:
+        async with sessionmaker() as session, firm_context(firm_id):
+            firm = (
+                await session.execute(select(Firm).where(Firm.id == firm_id))
+            ).scalar_one()
+            user = (
+                await session.execute(select(User).where(User.id == user_id))
+            ).scalar_one()
+            with pytest.raises(ConnectorAuthError, match="no stored refresh"):
+                await refresh_access_token(session, user, firm)
+
+    asyncio.run(_run())
+
+    audits = _audit_entries_for(sessionmaker, firm_id)
+    failed = [a for a in audits if a.action == "graph.token_refresh_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "missing_refresh_token"
+
+
+def test_refresh_firm_without_secret_raises_auth_error(
+    graph_auth_environment,
+) -> None:
+    """Firm row with NULL azure_client_secret_ciphertext fails fast."""
+    sessionmaker = graph_auth_environment["sessionmaker"]
+    created = graph_auth_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed_firm_and_user(
+        sessionmaker,
+        slug=f"graph-nosecret-{uuid.uuid4().hex[:8]}",
+        tenant_id=str(uuid.uuid4()),
+        client_id=str(uuid.uuid4()),
+        client_secret_plain="placeholder",
+        refresh_token_plain="some-refresh",
+    )
+    created.append(firm_id)
+
+    async def _clear_secret() -> None:
+        async with sessionmaker() as session, firm_context(firm_id):
+            firm = (
+                await session.execute(select(Firm).where(Firm.id == firm_id))
+            ).scalar_one()
+            firm.azure_client_secret_ciphertext = None
+            await session.commit()
+
+    asyncio.run(_clear_secret())
+
+    async def _run() -> None:
+        async with sessionmaker() as session, firm_context(firm_id):
+            firm = (
+                await session.execute(select(Firm).where(Firm.id == firm_id))
+            ).scalar_one()
+            user = (
+                await session.execute(select(User).where(User.id == user_id))
+            ).scalar_one()
+            with pytest.raises(ConnectorAuthError, match="not configured"):
+                await refresh_access_token(session, user, firm)
+
+    asyncio.run(_run())
+
+    audits = _audit_entries_for(sessionmaker, firm_id)
+    failed = [a for a in audits if a.action == "graph.token_refresh_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "missing_firm_secret"

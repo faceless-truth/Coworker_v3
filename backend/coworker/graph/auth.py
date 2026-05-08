@@ -87,6 +87,26 @@ async def refresh_access_token(
     firm_id_str = str(firm.id)
     user_id_str = str(user.id)
 
+    # NULL ciphertexts shouldn't reach this path (the OAuth callback
+    # writes both, and refresh is only invoked for already-onboarded
+    # users), but the columns are nullable so we narrow defensively.
+    # An obscure AttributeError otherwise; ConnectorAuthError lets the
+    # caller surface "sign in again" cleanly.
+    if user.ms_refresh_token_ciphertext is None:
+        await _audit_failure_and_commit(
+            session, firm_id_str, user_id_str, "missing_refresh_token"
+        )
+        raise ConnectorAuthError(
+            "user has no stored refresh token; sign in again"
+        )
+    if firm.azure_client_secret_ciphertext is None:
+        await _audit_failure_and_commit(
+            session, firm_id_str, user_id_str, "missing_firm_secret"
+        )
+        raise ConnectorAuthError(
+            "firm Azure client secret is not configured"
+        )
+
     try:
         refresh_token = decrypt_str(
             user.ms_refresh_token_ciphertext, firm_id=firm_id_str
@@ -139,7 +159,10 @@ async def refresh_access_token(
         )
 
     body = response.json()
-    new_access_token = body["access_token"]
+    # response.json() returns Any; Microsoft's contract guarantees
+    # `access_token` is a string and `expires_in` is an integer-shaped
+    # number. str() / int() coerce + narrow for mypy.
+    new_access_token: str = str(body["access_token"])
     expires_in = int(body["expires_in"])
     expires_at = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(
         seconds=expires_in
