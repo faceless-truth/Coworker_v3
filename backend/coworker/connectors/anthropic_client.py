@@ -200,6 +200,7 @@ class AnthropicClient:
         model: str,
         max_tokens: int,
         system: str | None = None,
+        thinking_budget: int | None = None,
     ) -> CompletionResult:
         """Send a completion to Anthropic; scrub on the way out, restore on return.
 
@@ -209,6 +210,14 @@ class AnthropicClient:
                 hardcode model strings at call sites.
             max_tokens: maximum response length.
             system: optional system prompt; scrubbed too.
+            thinking_budget: opt-in extended thinking. When set, the
+                model is allowed to spend up to ``thinking_budget``
+                tokens reasoning before producing the visible
+                response. Default 16000 in Settings; specialists
+                (Phase 8) override to 32000. Pass ``None`` to disable
+                thinking. The decision *when* to enable thinking is
+                an orchestrator concern (Phase 5 has the
+                auto-enable rules); this connector just forwards.
 
         Returns:
             ``CompletionResult`` with the response text (placeholders
@@ -220,12 +229,30 @@ class AnthropicClient:
             ConnectorRateLimited: 429 from Anthropic. ``retry_after``
                 is parsed from the Retry-After header where present.
             ConnectorTransient: 5xx, timeout, or network error.
-            ValueError: ``messages`` is empty or ``max_tokens`` < 1.
+            ValueError: ``messages`` is empty, ``max_tokens`` < 1, or
+                ``thinking_budget`` < 1024 (Anthropic minimum).
         """
         if not messages:
             raise ValueError("messages must contain at least one entry")
         if max_tokens < 1:
             raise ValueError("max_tokens must be >= 1")
+        if thinking_budget is not None and thinking_budget < 1024:
+            # Anthropic enforces a 1024-token minimum thinking budget
+            # at the API layer. Validate locally so the error
+            # surfaces as a clean ValueError rather than an opaque
+            # 400 from the SDK with a vague message.
+            raise ValueError(
+                "thinking_budget must be >= 1024 (Anthropic minimum); "
+                f"got {thinking_budget}"
+            )
+        if thinking_budget is not None and thinking_budget >= max_tokens:
+            # The thinking budget eats into max_tokens; allowing
+            # thinking_budget >= max_tokens leaves no room for the
+            # actual response and produces empty output.
+            raise ValueError(
+                "thinking_budget must be strictly less than max_tokens "
+                f"(got thinking_budget={thinking_budget}, max_tokens={max_tokens})"
+            )
 
         scrubbed_messages, mapping = self._scrub_messages(messages)
         scrubbed_system, system_mapping = self._scrub_system(system)
@@ -242,6 +269,11 @@ class AnthropicClient:
         }
         if scrubbed_system is not None:
             create_kwargs["system"] = scrubbed_system
+        if thinking_budget is not None:
+            create_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
 
         try:
             response = await self._client.messages.create(**create_kwargs)

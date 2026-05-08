@@ -262,6 +262,84 @@ async def test_complete_invalid_max_tokens_rejected() -> None:
 # --------------------------- representation safety --------------------------
 
 
+async def test_complete_thinking_budget_passes_through() -> None:
+    """thinking_budget=N adds {"type": "enabled", "budget_tokens": N}."""
+    captured: dict[str, str] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.read().decode("utf-8")
+        return httpx.Response(
+            200, json=_success_payload(text="reasoned")
+        )
+
+    client = _client()
+    with respx.mock(assert_all_called=True) as rmock:
+        rmock.post(_ANTHROPIC_MESSAGES_URL).mock(side_effect=_capture)
+        await client.complete(
+            messages=[CompletionMessage(role="user", content="Hi")],
+            model="claude-opus-4-7",
+            max_tokens=8000,
+            thinking_budget=4000,
+        )
+
+    body = captured["body"]
+    assert '"thinking"' in body
+    assert '"type":"enabled"' in body
+    assert '"budget_tokens":4000' in body
+
+
+async def test_complete_no_thinking_when_budget_is_none() -> None:
+    captured: dict[str, str] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.read().decode("utf-8")
+        return httpx.Response(
+            200, json=_success_payload(text="ok")
+        )
+
+    client = _client()
+    with respx.mock(assert_all_called=True) as rmock:
+        rmock.post(_ANTHROPIC_MESSAGES_URL).mock(side_effect=_capture)
+        await client.complete(
+            messages=[CompletionMessage(role="user", content="Hi")],
+            model="claude-sonnet-4-6",
+            max_tokens=100,
+        )
+
+    body = captured["body"]
+    assert "thinking" not in body
+
+
+async def test_complete_thinking_budget_below_minimum_rejected() -> None:
+    client = _client()
+    with pytest.raises(ValueError, match="1024"):
+        await client.complete(
+            messages=[CompletionMessage(role="user", content="Hi")],
+            model="claude-opus-4-7",
+            max_tokens=8000,
+            thinking_budget=100,
+        )
+
+
+async def test_complete_thinking_budget_exceeds_max_tokens_rejected() -> None:
+    """thinking_budget >= max_tokens leaves no room for visible output."""
+    client = _client()
+    with pytest.raises(ValueError, match="strictly less than max_tokens"):
+        await client.complete(
+            messages=[CompletionMessage(role="user", content="Hi")],
+            model="claude-opus-4-7",
+            max_tokens=2000,
+            thinking_budget=2000,
+        )
+    with pytest.raises(ValueError, match="strictly less than max_tokens"):
+        await client.complete(
+            messages=[CompletionMessage(role="user", content="Hi")],
+            model="claude-opus-4-7",
+            max_tokens=2000,
+            thinking_budget=3000,
+        )
+
+
 async def test_count_tokens_returns_input_count() -> None:
     client = _client()
     with respx.mock(assert_all_called=True) as rmock:
