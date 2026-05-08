@@ -42,6 +42,8 @@ frontend/.next/
 .idea/
 *.swp
 *.swo
+*.bak
+*.orig
 
 # OS
 .DS_Store
