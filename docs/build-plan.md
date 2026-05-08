@@ -78,28 +78,34 @@ Time estimates are deliberately omitted. Estimates corrode into deadlines and de
 
 **Goal restatement:** Five connectors (Anthropic, Microsoft Graph, XPM, FuseSign, Teams) that are the **only** code paths making raw HTTP calls to external systems. Every credential per-firm. Every write shadow-guarded. Every call audited and rate-limited. PII scrubbed before every Anthropic prompt. Errors normalised.
 
-### 3A. Finish Phase 3 day one — `GET /api/inbox` (5 commits remaining)
+### 3A. Phase 3 day one — `GET /api/inbox` ✅ COMPLETE
 
-**Already done:** Step 0 (preflight), Step 1 (`current_user`), Step 2 (`refresh_access_token`).
+**Closed 2026-05-08.** All seven steps shipped on main; 83 tests green; carry-forward items §8.8 / §8.9 / §8.10 closed alongside.
 
-| # | Step | Files | Test deliverable |
-|---|------|-------|------------------|
-| 3 | Token bucket (1000/60s global) + per-mailbox semaphore (4 in-flight) | `coworker/graph/rate_limit.py` (new) | unit: bucket waits past tokens exhausted; semaphore caps concurrency |
-| 4 | `graph_context` FastAPI dependency: returns `GraphContext` dataclass with `firm`, `user`, `access_token`, `session`. Re-enters `firm_context` for the request scope. Auto-refreshes if `ms_token_expires_at` within 5-minute buffer. | `coworker/graph/__init__.py` (extend) or new `coworker/graph/context.py` | integration: token within buffer triggers refresh; far-from-expiry does not |
-| 5 | `list_inbox(ctx, top=25)` — calls `GET /me/messages?$top=25&$orderby=receivedDateTime desc`. Goes through rate limit. Returns parsed list. Audits `graph.mail.list_inbox`. | `coworker/graph/mail.py` (new) | integration with `respx`: success returns 25 items; 401 → `ConnectorAuthError`; 429 → `ConnectorRateLimited`; 5xx → `ConnectorTransient` |
-| 6 | `GET /api/inbox` route — depends on `current_user` and `graph_context`, returns the list. | `coworker/api/routes/mail.py` (new), wired in `coworker/api/main.py` | integration with FastAPI TestClient: signed-in user gets 25 items; no-cookie returns generic 401 |
-| 7 | Phase-3-day-1 wrap. Run full pytest. Update `MCS-coworker-V3-spec.md` step table. Single commit closing day one. | — | full suite green |
-
-Pre-flight cleanup (one commit, before Step 3):
-- `git rm` `backend/coworker/api/routes/auth.p` (typo) and `auth.py.bak` (leftover) per carry-forward item §10.10.
-- Verify `.gitignore` covers `*.bak` — add if missing.
+| # | Step | Commit | Tests added |
+|---|------|--------|-------------|
+| 0 | Preflight, surface concerns | (notes only) | — |
+| 1 | `current_user` dependency in `coworker/api/deps.py` | `de20bec` | 7 |
+| 2 | `refresh_access_token` helper + audit logging | `277ad92` | 6 |
+| pf | Pre-flight cleanup + add this build plan | `9a87b40` | — |
+| 3 | Token bucket + per-mailbox semaphore | `7899b0a` | 15 |
+| 4 | `graph_context` FastAPI dependency | `c34c140` | 7 |
+| cf | `alg=none` + cross-firm body tests (carry-forward) | `656cd6b` | 1 |
+| 5 | `list_inbox` via Microsoft Graph | `dbe3d35` | 9 |
+| 6 | `GET /api/inbox` route | `7c6d2ca` | 4 |
+| 7 | Day-one wrap (this commit) | (current) | — |
 
 **Sub-phase 3A exit checklist:**
-- [ ] `pytest backend/tests` green; new tests for Steps 3–6 included
-- [ ] `mypy --strict` clean on touched files
-- [ ] `GET /api/inbox` returns 25 messages locally with a real signed-in user (manual verify)
-- [ ] No untracked or `.bak` files in `git status`
-- [ ] Token refresh observable in audit log on a deliberately-near-expiry user
+- [x] `pytest backend/tests` green — 83 tests
+- [x] `mypy --strict` clean on every new module (`graph/rate_limit.py`, `graph/context.py`, `graph/mail.py`, `api/routes/mail.py`)
+- [x] No untracked or `.bak` files in `git status`
+- [x] Carry-forward §8.8 (`alg=none` test) closed
+- [x] Carry-forward §8.9 (cross-firm body) closed
+- [x] Carry-forward §8.10 (untracked `auth.p` / `auth.py.bak`) closed
+- [ ] Manual verify: `GET /api/inbox` returns 25 messages locally with a real signed-in user (Elio runs this; cannot be automated against the real Microsoft tenant)
+- [ ] Manual verify: token refresh observable in audit log on a near-expiry user (Elio runs this)
+
+The two manual verifications need a real Microsoft tenant and live OAuth flow — they're checklist items for Elio, not automated tests.
 
 ### 3B. Anthropic connector (highest blast radius — build first after 3A)
 
