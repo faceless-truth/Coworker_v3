@@ -36,12 +36,16 @@ in subsequent Phase 3E sub-commits.
 """
 import datetime as _dt
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from coworker.connectors.exceptions import (
     ConnectorAuthError,
+    ConnectorNotFound,
+    ConnectorRateLimited,
     ConnectorTransient,
 )
 from coworker.db.models.tenancy import Firm
@@ -63,6 +67,40 @@ _TOKEN_REFRESH_BUFFER = _dt.timedelta(minutes=5)
 _DEFAULT_ACCESS_TOKEN_TTL_SECONDS = 1800
 
 SYSTEM_ACTOR = "system"
+
+
+# NOTE: The exact XPM endpoint paths and response field names below
+# are based on the documented Xero Practice Manager API surface as of
+# 2026. They are URL-encoded into constants so that any drift surfaced
+# during Phase 16A shadow testing can be fixed in one place. The
+# connector's shape — auth, audit, error mapping, pagination — is the
+# load-bearing contract; the specific paths can be adjusted without
+# touching callers.
+_CLIENTS_LIST_PATH = "clients.api/list"
+_CLIENT_GET_PATH = "client.api/get"  # /{client_id}
+
+
+class XPMClientRecord(BaseModel):
+    """An XPM Client (the firm's customer/contact record).
+
+    Narrow projection of XPM's wide schema. Plugin code consumes this
+    shape, not the raw Xero JSON, so the plugin layer stays insulated
+    from upstream schema drift.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str
+    email: str | None = None
+    phone: str | None = None
+    is_active: bool = True
+    # Entity type (Individual / Company / Trust / Partnership / SMSF
+    # / Sole Trader). Free-text from Xero — we don't constrain to a
+    # Literal because XPM admins can configure their own types.
+    entity_type: str | None = None
+    created_at: _dt.datetime
+    modified_at: _dt.datetime
 
 
 class XPMClient:
@@ -106,6 +144,161 @@ class XPMClient:
     @property
     def firm(self) -> Firm:
         return self._firm
+
+    async def list_clients(
+        self,
+        *,
+        updated_since: _dt.datetime | None = None,
+    ) -> list[XPMClientRecord]:
+        """List XPM clients (the firm's customer records).
+
+        Args:
+            updated_since: optional tz-aware datetime for incremental
+                sync. When provided, only clients modified at-or-after
+                the timestamp are returned. The Phase 4 KG populator
+                uses this for nightly delta loads.
+
+        Returns:
+            One page of clients. Pagination (Link: rel=next) is added
+            in 3E-5; for now callers get the first page only.
+
+        Raises:
+            ConnectorAuthError: 401 / 403 / other unhandled 4xx.
+            ConnectorRateLimited: 429.
+            ConnectorTransient: 5xx / network error.
+            ValueError: ``updated_since`` is tz-naive.
+        """
+        if updated_since is not None and updated_since.tzinfo is None:
+            raise ValueError("updated_since must be tz-aware")
+
+        action = "xpm.clients.list"
+        params: dict[str, Any] = {}
+        if updated_since is not None:
+            params["modifiedsince"] = (
+                updated_since.astimezone(_dt.UTC)
+                .replace(tzinfo=None)
+                .isoformat(timespec="seconds")
+            )
+        url = f"{_API_BASE}/{_CLIENTS_LIST_PATH}"
+        extra: dict[str, Any] = {}
+        if updated_since is not None:
+            extra["modifiedsince"] = params["modifiedsince"]
+
+        response = await self._authenticated_get(
+            url=url, params=params, action=action, extra=extra
+        )
+        body = response.json()
+        raw_items = _extract_collection(body, key="Clients")
+        clients = [_parse_client_record(item) for item in raw_items]
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "count": len(clients),
+                **extra,
+            },
+        )
+        await self._session.commit()
+        return clients
+
+    async def get_client(self, client_id: str) -> XPMClientRecord:
+        """Fetch one XPM client by id.
+
+        Raises:
+            ConnectorNotFound: 404 (client deleted or never existed).
+            ConnectorAuthError, ConnectorRateLimited, ConnectorTransient.
+            ValueError: ``client_id`` is empty.
+        """
+        if not client_id:
+            raise ValueError("client_id must be non-empty")
+
+        action = "xpm.clients.get"
+        url = f"{_API_BASE}/{_CLIENT_GET_PATH}/{quote(client_id, safe='')}"
+        extra: dict[str, Any] = {"client_id": client_id}
+
+        response = await self._authenticated_get(
+            url=url, params={}, action=action, extra=extra,
+            allow_not_found=True,
+        )
+        body = response.json()
+        record = _parse_client_record(_extract_single(body, key="Client"))
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "client_id": client_id,
+            },
+        )
+        await self._session.commit()
+        return record
+
+    async def _authenticated_get(
+        self,
+        *,
+        url: str,
+        params: dict[str, Any],
+        action: str,
+        extra: dict[str, Any],
+        allow_not_found: bool = False,
+    ) -> httpx.Response:
+        """GET with bearer token (refreshing if needed); audit + raise on error.
+
+        Returns the response on 2xx. Callers parse ``response.json()``
+        themselves so each method controls its own schema mapping.
+        """
+        access_token = await self._ensure_access_token()
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                response = await http.get(
+                    url,
+                    params=params,
+                    headers=self._auth_headers(access_token),
+                )
+        except httpx.RequestError as exc:
+            await self._audit_failure(
+                action=action, reason="network_error", extra=extra
+            )
+            raise ConnectorTransient(
+                "network error talking to XPM"
+            ) from exc
+
+        await self._raise_for_xero_status(
+            response,
+            action=action,
+            allow_not_found=allow_not_found,
+            extra=extra,
+        )
+        return response
+
+    def _auth_headers(self, access_token: str) -> dict[str, str]:
+        """Standard auth + tenant headers for every XPM API call.
+
+        Xero APIs require the ``Xero-Tenant-Id`` header to disambiguate
+        which connected organisation the bearer token is acting on.
+        The tenant id lives on the firm row as ``xpm_account_id``.
+        Missing tenant id is a misconfigured firm; raise so the bug
+        surfaces at the first call rather than as opaque 4xx from Xero.
+        """
+        tenant_id = self._firm.xpm_account_id
+        if not tenant_id:
+            raise ConnectorAuthError(
+                f"firm {self._firm.id} has no xpm_account_id; cannot send Xero-Tenant-Id"
+            )
+        return {
+            "Authorization": f"Bearer {access_token}",
+            "Xero-Tenant-Id": tenant_id,
+            "Accept": "application/json",
+        }
 
     async def _ensure_access_token(self) -> str:
         """Return a non-expired XPM access token, refreshing if needed.
@@ -249,24 +442,177 @@ class XPMClient:
         )
 
     async def _audit_refresh_failure(self, reason: str) -> None:
-        """Append ``xpm.token_refresh_failed`` and commit.
+        """Token-refresh failure audit. Action ``xpm.token_refresh_failed``."""
+        await self._audit_failure(action="xpm.token_refresh", reason=reason)
 
-        Mirrors ``graph.auth._audit_failure_and_commit``: the audit row
-        is committed inline so it survives any subsequent rollback in
-        the caller's transaction (the calling XPM method may abort
-        before committing its own work).
+    async def _audit_failure(
+        self,
+        *,
+        action: str,
+        reason: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Append ``<action>_failed`` for any XPM operation and commit.
+
+        Committed inline so the audit row survives caller rollback —
+        same pattern as ``graph.auth._audit_failure_and_commit``.
+        Public XPM methods set their own action prefix (e.g.
+        ``xpm.clients.list``) so the failed action becomes
+        ``xpm.clients.list_failed``.
         """
         firm_id_str = str(self._firm.id)
         payload: dict[str, Any] = {
             "user_id": self._actor_id,
             "reason": reason,
         }
+        if extra:
+            payload.update(extra)
         await append_audit(
             self._session,
             firm_id=firm_id_str,
             actor_type=self._actor_type,
             actor_id=self._actor_id,
-            action="xpm.token_refresh_failed",
+            action=f"{action}_failed",
             payload=payload,
         )
         await self._session.commit()
+
+    async def _raise_for_xero_status(
+        self,
+        response: httpx.Response,
+        *,
+        action: str,
+        allow_not_found: bool,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Audit + raise the right ConnectorError for a non-2xx Xero response.
+
+        Same shape as ``graph.errors.raise_for_graph_status`` but with
+        ``xero_*`` reason prefixes. Returns silently on 2xx.
+
+        Raises:
+            ConnectorNotFound: 404 and ``allow_not_found=True``.
+            ConnectorAuthError: 401 / 403 / other unhandled 4xx.
+            ConnectorRateLimited: 429. ``retry_after`` from
+                Retry-After header when numeric.
+            ConnectorTransient: 5xx.
+        """
+        status = response.status_code
+        if 200 <= status < 300:
+            return
+
+        if status == 404 and allow_not_found:
+            await self._audit_failure(
+                action=action, reason="xero_404", extra=extra
+            )
+            raise ConnectorNotFound(f"XPM returned 404 for {action}")
+        if status == 401 or status == 403:
+            await self._audit_failure(
+                action=action, reason=f"xero_{status}", extra=extra
+            )
+            raise ConnectorAuthError(
+                f"XPM rejected request: HTTP {status}"
+            )
+        if status == 429:
+            retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            await self._audit_failure(
+                action=action, reason="xero_429", extra=extra
+            )
+            raise ConnectorRateLimited(retry_after=retry_after)
+        if 500 <= status < 600:
+            await self._audit_failure(
+                action=action, reason="xero_5xx", extra=extra
+            )
+            raise ConnectorTransient(f"XPM returned {status}")
+
+        # Other 4xx — treat as auth-class. Refine to ConnectorPermanent
+        # when we encounter a real case worth distinguishing.
+        await self._audit_failure(
+            action=action, reason=f"xero_{status}", extra=extra
+        )
+        raise ConnectorAuthError(f"XPM returned {status}")
+
+
+def _parse_retry_after(header: str | None) -> float | None:
+    """Parse a numeric Retry-After header into seconds; None otherwise."""
+    if header is None:
+        return None
+    try:
+        return float(header)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_xpm_datetime(value: str) -> _dt.datetime:
+    """Parse Xero's ISO-8601 timestamp into a tz-aware ``datetime``.
+
+    Xero sometimes returns naive ISO timestamps (no Z suffix); treat
+    those as UTC. Anything with an explicit offset is preserved.
+    """
+    parsed = _dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt.UTC)
+    return parsed
+
+
+def _extract_collection(body: Any, *, key: str) -> list[dict[str, Any]]:
+    """Pull a list of records out of XPM's response envelope.
+
+    Xero APIs use varied shapes. The Practice Manager API frequently
+    returns ``{"Clients": [...]}`` or ``{"Response": {"Clients": [...]}}``.
+    We accept either, plus a raw list, so the parser is forgiving of
+    minor envelope changes.
+    """
+    if isinstance(body, list):
+        items_list: list[dict[str, Any]] = body
+        return items_list
+    if isinstance(body, dict):
+        if key in body and isinstance(body[key], list):
+            top_items: list[dict[str, Any]] = body[key]
+            return top_items
+        # Nested under "Response"
+        response = body.get("Response")
+        if isinstance(response, dict) and isinstance(response.get(key), list):
+            nested_items: list[dict[str, Any]] = response[key]
+            return nested_items
+    return []
+
+
+def _extract_single(body: Any, *, key: str) -> dict[str, Any]:
+    """Pull a single record out of XPM's response envelope.
+
+    ``{key: {...}}`` or ``{"Response": {key: {...}}}`` or a raw object.
+    Raises ``ValueError`` if the body doesn't match any expected shape.
+    """
+    if not isinstance(body, dict):
+        raise ValueError(f"XPM returned non-object body where {key} expected")
+    if key in body and isinstance(body[key], dict):
+        record = body[key]
+        assert isinstance(record, dict)
+        return record
+    response = body.get("Response")
+    if isinstance(response, dict) and isinstance(response.get(key), dict):
+        record = response[key]
+        assert isinstance(record, dict)
+        return record
+    # Fall back to treating the whole body as the record (Xero
+    # sometimes returns the bare object on /get endpoints).
+    return body
+
+
+def _parse_client_record(raw: dict[str, Any]) -> XPMClientRecord:
+    """Map one XPM Client dict into an ``XPMClientRecord``.
+
+    Field names follow Xero's PascalCase convention. Optional fields
+    fall back to None / sensible defaults.
+    """
+    return XPMClientRecord(
+        id=str(raw["ID"]),
+        name=raw.get("Name") or "",
+        email=raw.get("Email") or None,
+        phone=raw.get("Phone") or None,
+        is_active=bool(raw.get("IsActive", True)),
+        entity_type=raw.get("Type") or None,
+        created_at=_parse_xpm_datetime(raw["CreatedDate"]),
+        modified_at=_parse_xpm_datetime(raw["ModifiedDate"]),
+    )

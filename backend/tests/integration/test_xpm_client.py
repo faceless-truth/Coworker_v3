@@ -22,9 +22,11 @@ from sqlalchemy.pool import NullPool
 
 from coworker.connectors.exceptions import (
     ConnectorAuthError,
+    ConnectorNotFound,
+    ConnectorRateLimited,
     ConnectorTransient,
 )
-from coworker.connectors.xpm_client import XPMClient
+from coworker.connectors.xpm_client import XPMClient, XPMClientRecord
 from coworker.db.models.audit import AuditLogEntry
 from coworker.db.models.tenancy import Firm
 from coworker.db.session import _attach_pool_listeners, firm_context
@@ -87,6 +89,7 @@ def _seed_firm(
     xpm_refresh_token: str | None = "refresh-tok-1",
     xpm_access_token: str | None = "access-tok-1",
     expires_at: _dt.datetime | None = None,
+    xpm_account_id: str | None = "tenant-aaa",
 ) -> uuid.UUID:
     """Seed a firm with XPM credentials. Returns firm_id."""
 
@@ -99,6 +102,7 @@ def _seed_firm(
                 "name": "XPM Test Firm",
                 "slug": slug,
                 "xpm_client_id": xpm_client_id,
+                "xpm_account_id": xpm_account_id,
             }
             if xpm_client_secret is not None:
                 kwargs["xpm_client_secret_ciphertext"] = encrypt_str(
@@ -494,5 +498,399 @@ def test_ensure_access_token_refreshes_when_access_ciphertext_missing(
                 return_value=httpx.Response(200, json=_token_response())
             )
             return await client._ensure_access_token()
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# list_clients
+# =========================================================================
+
+
+_CLIENTS_LIST_URL = (
+    "https://api.xero.com/practicemanager/3.1/clients.api/list"
+)
+_CLIENT_GET_URL_PREFIX = (
+    "https://api.xero.com/practicemanager/3.1/client.api/get"
+)
+
+
+def _client_payload(
+    *,
+    cid: str = "c-1",
+    name: str = "Acme Pty Ltd",
+    email: str = "info@acme.example",
+    phone: str = "0412 000 000",
+    is_active: bool = True,
+    entity_type: str = "Company",
+    created: str = "2024-01-15T10:00:00",
+    modified: str = "2024-05-01T11:00:00",
+) -> dict:
+    return {
+        "ID": cid,
+        "Name": name,
+        "Email": email,
+        "Phone": phone,
+        "IsActive": is_active,
+        "Type": entity_type,
+        "CreatedDate": created,
+        "ModifiedDate": modified,
+    }
+
+
+def _seed_with_valid_token(sm, *, slug: str) -> uuid.UUID:
+    """Seed a firm whose access token is valid for another hour."""
+    return _seed_firm(
+        sm,
+        slug=slug,
+        xpm_access_token="cached-access",
+        expires_at=_dt.datetime.now(_dt.UTC) + _dt.timedelta(hours=1),
+    )
+
+
+def test_list_clients_returns_parsed_records_and_audits(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lc-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    payload = {
+        "Clients": [
+            _client_payload(cid="c-1", name="Acme Pty Ltd"),
+            _client_payload(
+                cid="c-2", name="Beta Trust", entity_type="Trust"
+            ),
+        ]
+    }
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(_CLIENTS_LIST_URL).mock(
+                return_value=httpx.Response(200, json=payload)
+            )
+            clients = await client.list_clients()
+        sent = route.calls.last.request
+        assert sent.headers["Authorization"] == "Bearer cached-access"
+        assert sent.headers["Xero-Tenant-Id"] == "tenant-aaa"
+        assert sent.headers["Accept"] == "application/json"
+        assert "modifiedsince" not in sent.url.params
+        return clients
+
+    clients = _run_with_firm(sm, firm_id, body)
+    assert len(clients) == 2
+    assert all(isinstance(c, XPMClientRecord) for c in clients)
+    assert clients[0].id == "c-1"
+    assert clients[0].name == "Acme Pty Ltd"
+    assert clients[0].entity_type == "Company"
+    assert clients[0].created_at.tzinfo is not None
+    assert clients[1].entity_type == "Trust"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.clients.list"]
+    assert len(success) == 1
+    assert success[0].payload["count"] == 2
+
+
+def test_list_clients_passes_modifiedsince_for_incremental_sync(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lcms-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    updated_since = _dt.datetime(2025, 4, 1, 12, 0, 0, tzinfo=_dt.UTC)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(_CLIENTS_LIST_URL).mock(
+                return_value=httpx.Response(200, json={"Clients": []})
+            )
+            await client.list_clients(updated_since=updated_since)
+        sent = route.calls.last.request
+        assert sent.url.params["modifiedsince"] == "2025-04-01T12:00:00"
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.clients.list"]
+    assert success[0].payload["modifiedsince"] == "2025-04-01T12:00:00"
+
+
+def test_list_clients_handles_response_envelope(xpm_environment) -> None:
+    """Tolerates {"Response": {"Clients": [...]}} wrapper too."""
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-env-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_CLIENTS_LIST_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"Response": {"Clients": [_client_payload(cid="x")]}},
+                )
+            )
+            return await client.list_clients()
+
+    clients = _run_with_firm(sm, firm_id, body)
+    assert len(clients) == 1
+    assert clients[0].id == "x"
+
+
+def test_list_clients_401_raises_auth_error_and_audits(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lc401-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_CLIENTS_LIST_URL).mock(
+                return_value=httpx.Response(401)
+            )
+            with pytest.raises(ConnectorAuthError):
+                await client.list_clients()
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.list_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "xero_401"
+
+
+def test_list_clients_429_with_retry_after(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-429-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_CLIENTS_LIST_URL).mock(
+                return_value=httpx.Response(
+                    429, headers={"Retry-After": "30"}
+                )
+            )
+            with pytest.raises(ConnectorRateLimited) as excinfo:
+                await client.list_clients()
+            assert excinfo.value.retry_after == 30.0
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_list_clients_5xx_raises_transient(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lc5xx-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_CLIENTS_LIST_URL).mock(return_value=httpx.Response(503))
+            with pytest.raises(ConnectorTransient):
+                await client.list_clients()
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_list_clients_network_error_raises_transient_and_audits(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lcnet-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_CLIENTS_LIST_URL).mock(
+                side_effect=httpx.ConnectError("no net")
+            )
+            with pytest.raises(ConnectorTransient):
+                await client.list_clients()
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.list_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "network_error"
+
+
+def test_list_clients_rejects_naive_updated_since(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-naive-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.list_clients(updated_since=_dt.datetime(2024, 1, 1))
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_list_clients_missing_xpm_account_id_raises_auth_error(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(
+        sm,
+        slug=f"xpm-notenant-{uuid.uuid4().hex[:8]}",
+        xpm_access_token="cached",
+        expires_at=_dt.datetime.now(_dt.UTC) + _dt.timedelta(hours=1),
+        xpm_account_id=None,
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ConnectorAuthError, match="xpm_account_id"):
+            await client.list_clients()
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# get_client
+# =========================================================================
+
+
+def test_get_client_returns_parsed_record_and_audits(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gc-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(f"{_CLIENT_GET_URL_PREFIX}/c-1").mock(
+                return_value=httpx.Response(
+                    200, json={"Client": _client_payload(cid="c-1")}
+                )
+            )
+            return await client.get_client("c-1")
+
+    record = _run_with_firm(sm, firm_id, body)
+    assert isinstance(record, XPMClientRecord)
+    assert record.id == "c-1"
+    assert record.name == "Acme Pty Ltd"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.clients.get"]
+    assert len(success) == 1
+    assert success[0].payload["client_id"] == "c-1"
+
+
+def test_get_client_handles_bare_object_envelope(xpm_environment) -> None:
+    """Some XPM endpoints return the record directly without an outer key."""
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gcb-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(f"{_CLIENT_GET_URL_PREFIX}/c-1").mock(
+                return_value=httpx.Response(200, json=_client_payload(cid="c-1"))
+            )
+            return await client.get_client("c-1")
+
+    record = _run_with_firm(sm, firm_id, body)
+    assert record.id == "c-1"
+
+
+def test_get_client_404_raises_not_found(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gc404-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(f"{_CLIENT_GET_URL_PREFIX}/missing").mock(
+                return_value=httpx.Response(404)
+            )
+            with pytest.raises(ConnectorNotFound):
+                await client.get_client("missing")
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.get_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "xero_404"
+    assert failed[0].payload["client_id"] == "missing"
+
+
+def test_get_client_percent_encodes_id_with_special_chars(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gcurl-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    cid = "id/with=slashes"
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(
+                url__regex=(
+                    r"^https://api\.xero\.com/practicemanager/3\.1/"
+                    r"client\.api/get/[^/]+$"
+                )
+            ).mock(
+                return_value=httpx.Response(200, json=_client_payload(cid=cid))
+            )
+            await client.get_client(cid)
+        sent_url = str(route.calls.last.request.url)
+        assert "with/slashes" not in sent_url
+        assert "%2F" in sent_url
+        assert "%3D" in sent_url
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_get_client_rejects_empty_id(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gce-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.get_client("")
 
     _run_with_firm(sm, firm_id, body)
