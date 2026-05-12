@@ -43,6 +43,7 @@ from coworker.graph.mail import (
     get_attachment,
     get_message,
     list_inbox,
+    mark_as_read,
 )
 from coworker.security.encryption import encrypt_str
 
@@ -1560,5 +1561,215 @@ def test_create_draft_rejects_invalid_inputs(graph_mail_environment) -> None:
             await create_draft(
                 ctx, to=["a@x"], subject="x", body="x", in_reply_to=""
             )
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+
+# =========================================================================
+# mark_as_read
+# =========================================================================
+
+
+def test_mark_as_read_patches_message_and_audits(graph_mail_environment) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-ok-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    msg_id = "AAMk-mar-1"
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.patch(f"{_GRAPH_MESSAGES_URL}/{msg_id}").mock(
+                return_value=httpx.Response(200, json={"id": msg_id, "isRead": True})
+            )
+            result = await mark_as_read(ctx, msg_id)
+        assert result is None
+        sent = route.calls.last.request
+        assert sent.headers["Authorization"] == "Bearer bearer-xyz"
+        assert sent.headers["Content-Type"] == "application/json"
+        sent_payload = sent.read().decode()
+        assert '"isRead": true' in sent_payload or '"isRead":true' in sent_payload
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "graph.mail.mark_as_read"]
+    assert len(success) == 1
+    assert success[0].payload["message_id"] == msg_id
+    assert success[0].payload["user_id"] == str(user_id)
+
+
+def test_mark_as_read_idempotent_for_already_read(
+    graph_mail_environment,
+) -> None:
+    """Graph returns 200 whether or not the message was previously read."""
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-idem-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            # First call and second call — both succeed identically.
+            rmock.patch(f"{_GRAPH_MESSAGES_URL}/m1").mock(
+                return_value=httpx.Response(200, json={"id": "m1", "isRead": True})
+            )
+            await mark_as_read(ctx, "m1")
+            await mark_as_read(ctx, "m1")
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "graph.mail.mark_as_read"]
+    assert len(success) == 2
+
+
+def test_mark_as_read_percent_encodes_id_with_special_chars(
+    graph_mail_environment,
+) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-encode-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    msg_id = "AAMk/ADk=msg/with/slashes"
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.patch(
+                url__regex=r"^https://graph\.microsoft\.com/v1\.0/me/messages/[^/]+$"
+            ).mock(return_value=httpx.Response(200, json={"id": msg_id}))
+            await mark_as_read(ctx, msg_id)
+        sent_url = str(route.calls.last.request.url)
+        assert "with/slashes" not in sent_url
+        assert "%2F" in sent_url
+        assert "%3D" in sent_url
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+
+def test_mark_as_read_in_shadow_mode_blocks_with_no_http(
+    graph_mail_environment,
+) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-shadow-{uuid.uuid4().hex[:8]}", shadow_mode=True
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock():
+            with pytest.raises(ShadowModeBlocked) as excinfo:
+                await mark_as_read(ctx, "m1")
+            assert excinfo.value.action == "email.mark_as_read"
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    assert not any(a.action == "graph.mail.mark_as_read" for a in audits)
+    blocked = [a for a in audits if a.action == "shadow_blocked.email.mark_as_read"]
+    assert len(blocked) == 1
+
+
+def test_mark_as_read_404_raises_not_found_and_audits(
+    graph_mail_environment,
+) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-404-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.patch(f"{_GRAPH_MESSAGES_URL}/missing").mock(
+                return_value=httpx.Response(404, json={"error": "not found"})
+            )
+            with pytest.raises(ConnectorNotFound):
+                await mark_as_read(ctx, "missing")
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "graph.mail.mark_as_read_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "microsoft_404"
+    assert failed[0].payload["message_id"] == "missing"
+
+
+def test_mark_as_read_401_raises_auth_error(graph_mail_environment) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-401-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.patch(f"{_GRAPH_MESSAGES_URL}/m1").mock(
+                return_value=httpx.Response(401)
+            )
+            with pytest.raises(ConnectorAuthError):
+                await mark_as_read(ctx, "m1")
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+
+def test_mark_as_read_network_error_raises_transient_and_audits(
+    graph_mail_environment,
+) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-net-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.patch(f"{_GRAPH_MESSAGES_URL}/m1").mock(
+                side_effect=httpx.ConnectError("no network")
+            )
+            with pytest.raises(ConnectorTransient):
+                await mark_as_read(ctx, "m1")
+
+    _run_with_ctx(sm, firm_id, user_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "graph.mail.mark_as_read_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "network_error"
+    assert failed[0].payload["message_id"] == "m1"
+
+
+def test_mark_as_read_rejects_empty_id(graph_mail_environment) -> None:
+    sm = graph_mail_environment["sessionmaker"]
+    created = graph_mail_environment["created_firm_ids"]
+
+    firm_id, user_id = _seed(
+        sm, slug=f"mar-empty-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(ctx: GraphContext) -> None:
+        with pytest.raises(ValueError):
+            await mark_as_read(ctx, "")
 
     _run_with_ctx(sm, firm_id, user_id, body)

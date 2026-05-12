@@ -665,6 +665,96 @@ async def create_draft(
     return message
 
 
+async def mark_as_read(ctx: GraphContext, message_id: str) -> None:
+    """Mark a message as read in the user's mailbox.
+
+    Shadow-mode guarded. Returns None — the caller already knows the
+    intent; the audit row records what happened and the change is
+    visible in Outlook. PATCH ``{"isRead": true}`` on the message;
+    marking an already-read message is idempotent (Graph returns 200
+    either way).
+
+    Args:
+        ctx: per-request Graph bundle. ``ctx.session`` must already
+            be inside ``firm_context(ctx.firm.id)``.
+        message_id: message to mark. Percent-encoded into the URL.
+
+    Raises:
+        ShadowModeBlocked: ``firm.shadow_mode`` is True. Audit row
+            ``shadow_blocked.email.mark_as_read`` is already
+            committed by ``guard_writable``.
+        ConnectorAuthError: 401 / 403 / other unhandled 4xx.
+        ConnectorNotFound: 404 (message deleted between fetch and
+            mark — a normal race during high-volume processing).
+        ConnectorRateLimited: 429.
+        ConnectorTransient: 5xx, timeout, or network error.
+        ValueError: ``message_id`` is empty.
+    """
+    if not message_id:
+        raise ValueError("message_id must be non-empty")
+
+    mailbox_id = str(ctx.user.id)
+    firm_id_str = str(ctx.firm.id)
+    user_id_str = str(ctx.user.id)
+    action = "graph.mail.mark_as_read"
+    extra: dict[str, Any] = {"message_id": message_id}
+
+    await guard_writable(
+        ctx.session,
+        ctx.firm,
+        action="email.mark_as_read",
+        actor_type="user",
+        actor_id=user_id_str,
+    )
+
+    url = f"{_MESSAGES_ENDPOINT}/{quote(message_id, safe='')}"
+
+    rate_limiter = get_rate_limiter()
+    async with rate_limiter.slot(mailbox_id):
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                response = await http.patch(
+                    url,
+                    json={"isRead": True},
+                    headers={
+                        "Authorization": f"Bearer {ctx.access_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+        except httpx.RequestError as exc:
+            await audit_failure(
+                ctx.session,
+                firm_id=firm_id_str,
+                user_id=user_id_str,
+                action=action,
+                reason="network_error",
+                extra=extra,
+            )
+            raise ConnectorTransient(
+                "network error talking to Microsoft Graph"
+            ) from exc
+
+    await raise_for_graph_status(
+        response,
+        session=ctx.session,
+        firm_id=firm_id_str,
+        user_id=user_id_str,
+        action=action,
+        allow_not_found=True,
+        extra=extra,
+    )
+
+    await append_audit(
+        ctx.session,
+        firm_id=firm_id_str,
+        actor_type="user",
+        actor_id=user_id_str,
+        action=action,
+        payload={"user_id": user_id_str, "message_id": message_id},
+    )
+    await ctx.session.commit()
+
+
 def _build_draft_payload(
     *,
     to: list[str],
