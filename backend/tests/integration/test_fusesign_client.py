@@ -24,10 +24,13 @@ from coworker.connectors.exceptions import (
     ConnectorTransient,
 )
 from coworker.connectors.fusesign_client import (
+    CreateEnvelopeDocument,
+    CreateEnvelopeRecipient,
     FuseSignClient,
     FuseSignEnvelope,
     FuseSignRecipient,
 )
+from coworker.connectors.shadow_mode import ShadowModeBlocked
 from coworker.db.models.audit import AuditLogEntry
 from coworker.db.models.tenancy import Firm
 from coworker.db.session import _attach_pool_listeners, firm_context
@@ -532,5 +535,336 @@ def test_get_envelope_rejects_empty_id(fusesign_environment) -> None:
         client = FuseSignClient(firm, session=session)
         with pytest.raises(ValueError):
             await client.get_envelope("")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# create_envelope (shadow-guarded write)
+# =========================================================================
+
+
+def _sample_recipients() -> list[CreateEnvelopeRecipient]:
+    return [
+        CreateEnvelopeRecipient(
+            name="Jane Director",
+            email="jane@acme.example",
+            role="signer",
+        ),
+    ]
+
+
+def _sample_documents() -> list[CreateEnvelopeDocument]:
+    return [
+        CreateEnvelopeDocument(
+            name="engagement-letter.pdf",
+            content_base64="JVBERi0xLjQK",  # %PDF-1.4
+        ),
+    ]
+
+
+def test_create_envelope_posts_payload_and_returns_envelope(
+    fusesign_environment,
+) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-ce-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.post(_ENVELOPES_URL).mock(
+                return_value=httpx.Response(
+                    201, json=_envelope_payload(eid="env-new")
+                )
+            )
+            env = await client.create_envelope(
+                name="Engagement Letter",
+                recipients=_sample_recipients(),
+                documents=_sample_documents(),
+            )
+        sent = route.calls.last.request
+        body_str = sent.read().decode()
+        assert "jane@acme.example" in body_str
+        assert "engagement-letter.pdf" in body_str
+        assert sent.headers["X-API-Key"] == "fs-api-key-123"
+        return env
+
+    env = _run_with_firm(sm, firm_id, body)
+    assert isinstance(env, FuseSignEnvelope)
+    assert env.id == "env-new"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "fusesign.envelopes.create"]
+    assert len(success) == 1
+    assert success[0].payload["envelope_id"] == "env-new"
+    assert success[0].payload["recipient_count"] == 1
+    assert success[0].payload["document_count"] == 1
+    assert success[0].payload["name"] == "Engagement Letter"
+
+
+def test_create_envelope_in_shadow_mode_blocks_with_no_http(
+    fusesign_environment,
+) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-ces-{uuid.uuid4().hex[:8]}", shadow_mode=True)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock():  # any HTTP attempt would fail
+            with pytest.raises(ShadowModeBlocked) as excinfo:
+                await client.create_envelope(
+                    name="Shadow Letter",
+                    recipients=_sample_recipients(),
+                    documents=_sample_documents(),
+                )
+            assert excinfo.value.action == "fusesign.create_envelope"
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    assert not any(a.action == "fusesign.envelopes.create" for a in audits)
+    blocked = [
+        a for a in audits if a.action == "shadow_blocked.fusesign.create_envelope"
+    ]
+    assert len(blocked) == 1
+
+
+def test_create_envelope_401_raises_auth_error_and_audits(
+    fusesign_environment,
+) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-ce401-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(_ENVELOPES_URL).mock(return_value=httpx.Response(401))
+            with pytest.raises(ConnectorAuthError):
+                await client.create_envelope(
+                    name="x",
+                    recipients=_sample_recipients(),
+                    documents=_sample_documents(),
+                )
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "fusesign.envelopes.create_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "fusesign_401"
+
+
+def test_create_envelope_rejects_invalid_inputs(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-ceinv-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.create_envelope(
+                name="", recipients=_sample_recipients(),
+                documents=_sample_documents(),
+            )
+        with pytest.raises(ValueError):
+            await client.create_envelope(
+                name="x", recipients=[], documents=_sample_documents(),
+            )
+        with pytest.raises(ValueError):
+            await client.create_envelope(
+                name="x", recipients=_sample_recipients(), documents=[],
+            )
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# send_reminder (shadow-guarded write)
+# =========================================================================
+
+
+def test_send_reminder_posts_and_audits(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-sr-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(f"{_ENVELOPES_URL}/env-1/reminders").mock(
+                return_value=httpx.Response(204)
+            )
+            result = await client.send_reminder("env-1")
+        assert result is None
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "fusesign.envelopes.send_reminder"]
+    assert len(success) == 1
+    assert success[0].payload["envelope_id"] == "env-1"
+
+
+def test_send_reminder_in_shadow_mode_blocks(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-srs-{uuid.uuid4().hex[:8]}", shadow_mode=True)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock():
+            with pytest.raises(ShadowModeBlocked) as excinfo:
+                await client.send_reminder("env-1")
+            assert excinfo.value.action == "fusesign.send_reminder"
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    blocked = [
+        a for a in audits if a.action == "shadow_blocked.fusesign.send_reminder"
+    ]
+    assert len(blocked) == 1
+
+
+def test_send_reminder_404_raises_not_found(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-sr4-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(f"{_ENVELOPES_URL}/missing/reminders").mock(
+                return_value=httpx.Response(404)
+            )
+            with pytest.raises(ConnectorNotFound):
+                await client.send_reminder("missing")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_send_reminder_rejects_empty_id(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-sre-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.send_reminder("")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# register_webhook (NOT shadow-guarded — observation infrastructure)
+# =========================================================================
+
+
+def test_register_webhook_posts_and_returns_id(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-rw-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.post("https://api.fusesign.com/v1/webhooks").mock(
+                return_value=httpx.Response(
+                    201, json={"id": "wh-7", "url": "https://app.example/hook"}
+                )
+            )
+            webhook_id = await client.register_webhook(
+                "https://app.example/hook"
+            )
+        sent = route.calls.last.request
+        body_str = sent.read().decode()
+        assert "https://app.example/hook" in body_str
+        return webhook_id
+
+    webhook_id = _run_with_firm(sm, firm_id, body)
+    assert webhook_id == "wh-7"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "fusesign.webhooks.register"]
+    assert len(success) == 1
+    assert success[0].payload["webhook_id"] == "wh-7"
+    assert success[0].payload["target_url"] == "https://app.example/hook"
+
+
+def test_register_webhook_not_shadow_guarded(fusesign_environment) -> None:
+    """Even a shadow-mode firm can register webhooks (observation infra)."""
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-rws-{uuid.uuid4().hex[:8]}", shadow_mode=True)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post("https://api.fusesign.com/v1/webhooks").mock(
+                return_value=httpx.Response(201, json={"id": "wh-1"})
+            )
+            # Should succeed without raising ShadowModeBlocked
+            return await client.register_webhook("https://hook.example")
+
+    webhook_id = _run_with_firm(sm, firm_id, body)
+    assert webhook_id == "wh-1"
+
+
+def test_register_webhook_2xx_missing_id_raises_transient(
+    fusesign_environment,
+) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-rwid-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post("https://api.fusesign.com/v1/webhooks").mock(
+                return_value=httpx.Response(201, json={})
+            )
+            with pytest.raises(ConnectorTransient):
+                await client.register_webhook("https://hook.example")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_register_webhook_rejects_empty_url(fusesign_environment) -> None:
+    sm = fusesign_environment["sessionmaker"]
+    created = fusesign_environment["created_firm_ids"]
+
+    firm_id = _seed_firm(sm, slug=f"fs-rwe-{uuid.uuid4().hex[:8]}", shadow_mode=False)
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = FuseSignClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.register_webhook("")
 
     _run_with_firm(sm, firm_id, body)

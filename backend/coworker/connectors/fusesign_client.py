@@ -37,12 +37,15 @@ from coworker.connectors.exceptions import (
     ConnectorRateLimited,
     ConnectorTransient,
 )
+from coworker.connectors.shadow_mode import guard_writable
 from coworker.db.models.tenancy import Firm
 from coworker.security.audit import append_audit
 from coworker.security.encryption import decrypt_str
 
 _API_BASE = "https://api.fusesign.com/v1"
 _ENVELOPES_PATH = "envelopes"
+_REMINDERS_PATH = "reminders"  # POST /envelopes/{id}/reminders
+_WEBHOOKS_PATH = "webhooks"
 
 SYSTEM_ACTOR = "system"
 
@@ -79,6 +82,31 @@ class FuseSignEnvelope(BaseModel):
     recipients: list[FuseSignRecipient] = []
     created_at: _dt.datetime
     updated_at: _dt.datetime
+
+
+class CreateEnvelopeRecipient(BaseModel):
+    """One recipient to include when creating a FuseSign envelope."""
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    email: str
+    role: str = "signer"  # "signer" / "viewer" / "approver"
+
+
+class CreateEnvelopeDocument(BaseModel):
+    """One document to upload when creating a FuseSign envelope.
+
+    ``content_base64`` is the document's bytes encoded as base64. The
+    caller is responsible for the encoding so the connector layer
+    stays free of file-system decisions — vision-pipeline output, KB
+    template renders, and ad-hoc uploads all go through the same path.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    content_base64: str
 
 
 class FuseSignClient:
@@ -190,6 +218,224 @@ class FuseSignClient:
         )
         await self._session.commit()
         return envelope
+
+    async def create_envelope(
+        self,
+        *,
+        name: str,
+        recipients: list[CreateEnvelopeRecipient],
+        documents: list[CreateEnvelopeDocument],
+    ) -> FuseSignEnvelope:
+        """Create a new FuseSign envelope.
+
+        Shadow-mode guarded. Returns the created envelope so callers
+        can persist its id and surface ``web_link``-equivalent fields.
+
+        Raises:
+            ShadowModeBlocked: firm.shadow_mode is True.
+            ConnectorAuthError, ConnectorRateLimited, ConnectorTransient.
+            ValueError: empty ``name`` / ``recipients`` / ``documents``
+                or any malformed entry.
+        """
+        if not name:
+            raise ValueError("name must be non-empty")
+        if not recipients:
+            raise ValueError("recipients must not be empty")
+        if not documents:
+            raise ValueError("documents must not be empty")
+
+        firm_id_str = str(self._firm.id)
+        action = "fusesign.envelopes.create"
+        extra: dict[str, Any] = {
+            "name": name,
+            "recipient_count": len(recipients),
+            "document_count": len(documents),
+        }
+
+        await guard_writable(
+            self._session,
+            self._firm,
+            action="fusesign.create_envelope",
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+        )
+
+        payload = {
+            "name": name,
+            "recipients": [
+                {"name": r.name, "email": r.email, "role": r.role}
+                for r in recipients
+            ],
+            "documents": [
+                {"name": d.name, "content_base64": d.content_base64}
+                for d in documents
+            ],
+        }
+        url = f"{_API_BASE}/{_ENVELOPES_PATH}"
+        response = await self._authenticated_post(
+            url=url, json=payload, action=action, extra=extra,
+            allow_not_found=False,
+        )
+        envelope = _parse_envelope(_extract_envelope_single(response.json()))
+
+        await append_audit(
+            self._session,
+            firm_id=firm_id_str,
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "envelope_id": envelope.id,
+                "recipient_count": len(recipients),
+                "document_count": len(documents),
+                # name lands in audit so principals reviewing shadow-
+                # mode log can see what would have been created. Name
+                # is typically the document title ("Engagement Letter
+                # — Acme Pty Ltd"), not PII-sensitive in itself.
+                "name": name,
+            },
+        )
+        await self._session.commit()
+        return envelope
+
+    async def send_reminder(self, envelope_id: str) -> None:
+        """Trigger a FuseSign reminder email to outstanding signers.
+
+        Shadow-mode guarded — the reminder is an outbound email,
+        which counts as a firm-data side effect.
+        """
+        if not envelope_id:
+            raise ValueError("envelope_id must be non-empty")
+
+        firm_id_str = str(self._firm.id)
+        action = "fusesign.envelopes.send_reminder"
+        extra: dict[str, Any] = {"envelope_id": envelope_id}
+
+        await guard_writable(
+            self._session,
+            self._firm,
+            action="fusesign.send_reminder",
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+        )
+
+        url = (
+            f"{_API_BASE}/{_ENVELOPES_PATH}/"
+            f"{quote(envelope_id, safe='')}/{_REMINDERS_PATH}"
+        )
+        await self._authenticated_post(
+            url=url, json={}, action=action, extra=extra,
+            allow_not_found=True,
+        )
+
+        await append_audit(
+            self._session,
+            firm_id=firm_id_str,
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "envelope_id": envelope_id,
+            },
+        )
+        await self._session.commit()
+
+    async def register_webhook(self, target_url: str) -> str:
+        """Register a webhook for envelope state changes.
+
+        Not shadow-guarded: webhook registration is observation
+        infrastructure, not a firm-data write. A shadow-mode firm
+        still needs FuseSign events flowing in so the system can
+        prepare (would-be) follow-up actions; the actions themselves
+        stay blocked at create_envelope / send_reminder.
+
+        Returns:
+            The new webhook's id.
+
+        Raises:
+            ConnectorAuthError, ConnectorRateLimited, ConnectorTransient.
+            ValueError: empty ``target_url``.
+        """
+        if not target_url:
+            raise ValueError("target_url must be non-empty")
+
+        firm_id_str = str(self._firm.id)
+        action = "fusesign.webhooks.register"
+        extra: dict[str, Any] = {"target_url": target_url}
+
+        url = f"{_API_BASE}/{_WEBHOOKS_PATH}"
+        response = await self._authenticated_post(
+            url=url,
+            json={"url": target_url},
+            action=action,
+            extra=extra,
+            allow_not_found=False,
+        )
+        raw = response.json()
+        webhook_id = str(raw.get("id") or "") if isinstance(raw, dict) else ""
+        if not webhook_id:
+            await self._audit_failure(
+                action=action,
+                reason="fusesign_missing_id",
+                extra=extra,
+            )
+            raise ConnectorTransient(
+                "FuseSign register_webhook returned no webhook ID"
+            )
+
+        await append_audit(
+            self._session,
+            firm_id=firm_id_str,
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "webhook_id": webhook_id,
+                "target_url": target_url,
+            },
+        )
+        await self._session.commit()
+        return webhook_id
+
+    async def _authenticated_post(
+        self,
+        *,
+        url: str,
+        json: dict[str, Any],
+        action: str,
+        extra: dict[str, Any],
+        allow_not_found: bool,
+    ) -> httpx.Response:
+        """POST JSON with API-key auth; audit + raise on error."""
+        api_key = self._require_api_key()
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                response = await http.post(
+                    url,
+                    json=json,
+                    headers={
+                        **self._auth_headers(api_key),
+                        "Content-Type": "application/json",
+                    },
+                )
+        except httpx.RequestError as exc:
+            await self._audit_failure(
+                action=action, reason="network_error", extra=extra
+            )
+            raise ConnectorTransient(
+                "network error talking to FuseSign"
+            ) from exc
+
+        await self._raise_for_fusesign_status(
+            response,
+            action=action,
+            allow_not_found=allow_not_found,
+            extra=extra,
+        )
+        return response
 
     async def _authenticated_get(
         self,
