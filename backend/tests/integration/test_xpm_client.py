@@ -8,6 +8,7 @@ own tests.
 import asyncio
 import datetime as _dt
 import uuid
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -26,7 +27,13 @@ from coworker.connectors.exceptions import (
     ConnectorRateLimited,
     ConnectorTransient,
 )
-from coworker.connectors.xpm_client import XPMClient, XPMClientRecord
+from coworker.connectors.xpm_client import (
+    XPMClient,
+    XPMClientRecord,
+    XPMInvoice,
+    XPMJob,
+    XPMRelationship,
+)
 from coworker.db.models.audit import AuditLogEntry
 from coworker.db.models.tenancy import Firm
 from coworker.db.session import _attach_pool_listeners, firm_context
@@ -892,5 +899,332 @@ def test_get_client_rejects_empty_id(xpm_environment) -> None:
         client = XPMClient(firm, session=session)
         with pytest.raises(ValueError):
             await client.get_client("")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+# =========================================================================
+# list_jobs / list_invoices / get_invoice / list_relationships
+# =========================================================================
+
+
+_JOBS_LIST_URL = "https://api.xero.com/practicemanager/3.1/jobs.api/list"
+_INVOICES_LIST_URL = "https://api.xero.com/practicemanager/3.1/invoices.api/list"
+_INVOICE_GET_URL_PREFIX = (
+    "https://api.xero.com/practicemanager/3.1/invoice.api/get"
+)
+_RELATIONSHIPS_LIST_URL = (
+    "https://api.xero.com/practicemanager/3.1/relationships.api/list"
+)
+
+
+def _job_payload(
+    *,
+    jid: str = "j-1",
+    name: str = "FY25 Tax Return",
+    client_id: str = "c-1",
+    state: str = "In Progress",
+    start: str = "2025-07-01T09:00:00",
+    due: str | None = "2025-10-31T17:00:00",
+    completed: str | None = None,
+) -> dict:
+    out: dict = {
+        "ID": jid,
+        "Name": name,
+        "ClientID": client_id,
+        "State": state,
+        "StartDate": start,
+    }
+    if due is not None:
+        out["DueDate"] = due
+    if completed is not None:
+        out["CompletedDate"] = completed
+    return out
+
+
+def _invoice_payload(
+    *,
+    iid: str = "inv-1",
+    number: str = "INV-0001",
+    client_id: str = "c-1",
+    total: str = "1100.00",
+    tax: str = "100.00",
+    currency: str = "AUD",
+    status: str = "Sent",
+    date: str = "2025-05-01T10:00:00",
+    due: str | None = "2025-05-31T10:00:00",
+) -> dict:
+    out: dict = {
+        "ID": iid,
+        "InvoiceNumber": number,
+        "ClientID": client_id,
+        "TotalAmount": total,
+        "TotalTax": tax,
+        "Currency": currency,
+        "Status": status,
+        "Date": date,
+    }
+    if due is not None:
+        out["DueDate"] = due
+    return out
+
+
+def _relationship_payload(
+    *,
+    rid: str = "r-1",
+    from_id: str = "c-1",
+    to_id: str = "c-2",
+    rel_type: str = "Director",
+    is_active: bool = True,
+) -> dict:
+    return {
+        "ID": rid,
+        "FromClientID": from_id,
+        "ToClientID": to_id,
+        "Type": rel_type,
+        "IsActive": is_active,
+    }
+
+
+def test_list_jobs_returns_parsed_records(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lj-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_JOBS_LIST_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={"Jobs": [_job_payload(jid="j-1"), _job_payload(
+                        jid="j-2", state="Complete",
+                        completed="2025-10-30T16:00:00",
+                    )]},
+                )
+            )
+            return await client.list_jobs()
+
+    jobs = _run_with_firm(sm, firm_id, body)
+    assert len(jobs) == 2
+    assert all(isinstance(j, XPMJob) for j in jobs)
+    assert jobs[0].state == "In Progress"
+    assert jobs[0].due_at is not None
+    assert jobs[0].completed_at is None
+    assert jobs[1].completed_at is not None
+    assert jobs[1].state == "Complete"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.jobs.list"]
+    assert len(success) == 1
+    assert success[0].payload["count"] == 2
+
+
+def test_list_jobs_scoped_to_client(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-ljc-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(_JOBS_LIST_URL).mock(
+                return_value=httpx.Response(200, json={"Jobs": []})
+            )
+            await client.list_jobs(client_id="c-42")
+        sent = route.calls.last.request
+        assert sent.url.params["clientid"] == "c-42"
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.jobs.list"]
+    assert success[0].payload["client_id"] == "c-42"
+
+
+def test_list_jobs_rejects_empty_client_id(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lje-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.list_jobs(client_id="")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_list_invoices_returns_parsed_records_with_decimal_amounts(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-li-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(_INVOICES_LIST_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "Invoices": [
+                            _invoice_payload(
+                                iid="inv-1",
+                                total="1234.56",
+                                tax="112.23",
+                            )
+                        ]
+                    },
+                )
+            )
+            return await client.list_invoices()
+
+    invoices = _run_with_firm(sm, firm_id, body)
+    assert len(invoices) == 1
+    inv = invoices[0]
+    assert isinstance(inv, XPMInvoice)
+    assert inv.id == "inv-1"
+    # Decimal-precise — no binary-float artefacts.
+    assert inv.total_amount == Decimal("1234.56")
+    assert inv.total_tax == Decimal("112.23")
+    assert inv.currency == "AUD"
+    assert inv.due_at is not None
+
+
+def test_list_invoices_scoped_to_client(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lic-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(_INVOICES_LIST_URL).mock(
+                return_value=httpx.Response(200, json={"Invoices": []})
+            )
+            await client.list_invoices(client_id="c-7")
+        assert route.calls.last.request.url.params["clientid"] == "c-7"
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_get_invoice_404_raises_not_found(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gi404-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(f"{_INVOICE_GET_URL_PREFIX}/missing").mock(
+                return_value=httpx.Response(404)
+            )
+            with pytest.raises(ConnectorNotFound):
+                await client.get_invoice("missing")
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.invoices.get_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "xero_404"
+    assert failed[0].payload["invoice_id"] == "missing"
+
+
+def test_get_invoice_happy_path(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-gi-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.get(f"{_INVOICE_GET_URL_PREFIX}/inv-1").mock(
+                return_value=httpx.Response(
+                    200, json={"Invoice": _invoice_payload(iid="inv-1")}
+                )
+            )
+            return await client.get_invoice("inv-1")
+
+    inv = _run_with_firm(sm, firm_id, body)
+    assert inv.id == "inv-1"
+    assert inv.number == "INV-0001"
+
+
+def test_list_relationships_returns_directed_edges(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lr-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.get(_RELATIONSHIPS_LIST_URL).mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "Relationships": [
+                            _relationship_payload(
+                                rid="r-1", rel_type="Director"
+                            ),
+                            _relationship_payload(
+                                rid="r-2",
+                                from_id="c-1",
+                                to_id="c-3",
+                                rel_type="Trustee",
+                                is_active=False,
+                            ),
+                        ]
+                    },
+                )
+            )
+            rels = await client.list_relationships("c-1")
+        assert route.calls.last.request.url.params["clientid"] == "c-1"
+        return rels
+
+    rels = _run_with_firm(sm, firm_id, body)
+    assert len(rels) == 2
+    assert all(isinstance(r, XPMRelationship) for r in rels)
+    assert rels[0].relationship_type == "Director"
+    assert rels[0].is_active is True
+    assert rels[1].relationship_type == "Trustee"
+    assert rels[1].is_active is False
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.relationships.list"]
+    assert len(success) == 1
+    assert success[0].payload["client_id"] == "c-1"
+    assert success[0].payload["count"] == 2
+
+
+def test_list_relationships_rejects_empty_client_id(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_valid_token(sm, slug=f"xpm-lre-{uuid.uuid4().hex[:8]}")
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.list_relationships("")
 
     _run_with_firm(sm, firm_id, body)

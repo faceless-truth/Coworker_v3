@@ -35,6 +35,7 @@ shape and credential checks. The read and write methods (
 in subsequent Phase 3E sub-commits.
 """
 import datetime as _dt
+from decimal import Decimal
 from typing import Any, Literal
 from urllib.parse import quote
 
@@ -78,6 +79,10 @@ SYSTEM_ACTOR = "system"
 # touching callers.
 _CLIENTS_LIST_PATH = "clients.api/list"
 _CLIENT_GET_PATH = "client.api/get"  # /{client_id}
+_JOBS_LIST_PATH = "jobs.api/list"
+_INVOICES_LIST_PATH = "invoices.api/list"
+_INVOICE_GET_PATH = "invoice.api/get"  # /{invoice_id}
+_RELATIONSHIPS_LIST_PATH = "relationships.api/list"
 
 
 class XPMClientRecord(BaseModel):
@@ -101,6 +106,59 @@ class XPMClientRecord(BaseModel):
     entity_type: str | None = None
     created_at: _dt.datetime
     modified_at: _dt.datetime
+
+
+class XPMJob(BaseModel):
+    """An XPM Job (the firm's unit of work for a client — tax return,
+    BAS lodgement, audit engagement, etc.).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    name: str
+    client_id: str
+    # XPM admins configure their own job states; common values include
+    # "In Progress", "Complete", "On Hold", "Cancelled". Free-text.
+    state: str
+    created_at: _dt.datetime
+    due_at: _dt.datetime | None = None
+    completed_at: _dt.datetime | None = None
+
+
+class XPMInvoice(BaseModel):
+    """An XPM Invoice. Amounts use ``Decimal`` for cent-precision."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    number: str
+    client_id: str
+    total_amount: Decimal
+    total_tax: Decimal
+    currency: str  # ISO 4217 — typically "AUD" for MC&S
+    status: str  # "Draft", "Approved", "Sent", "Paid", etc.
+    issued_at: _dt.datetime
+    due_at: _dt.datetime | None = None
+
+
+class XPMRelationship(BaseModel):
+    """A relationship edge between two XPM Clients.
+
+    Drives the Phase 4 knowledge graph. ``relationship_type`` is
+    free-text from XPM and includes values like ``"Director"``,
+    ``"Trustee"``, ``"Beneficiary"``, ``"Appointor"``,
+    ``"Shareholder"``, ``"Spouse"``. The KG populator maps these to
+    its own canonical types.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    from_client_id: str
+    to_client_id: str
+    relationship_type: str
+    is_active: bool = True
 
 
 class XPMClient:
@@ -241,6 +299,160 @@ class XPMClient:
         )
         await self._session.commit()
         return record
+
+    async def list_jobs(
+        self, *, client_id: str | None = None
+    ) -> list[XPMJob]:
+        """List XPM jobs, optionally scoped to one client.
+
+        Returns one page; pagination lands in 3E-5.
+
+        Raises:
+            ConnectorAuthError, ConnectorRateLimited, ConnectorTransient.
+            ValueError: ``client_id`` is an empty string (distinguish
+                from ``None``).
+        """
+        if client_id is not None and not client_id:
+            raise ValueError("client_id must be non-empty when provided")
+
+        action = "xpm.jobs.list"
+        url = f"{_API_BASE}/{_JOBS_LIST_PATH}"
+        params: dict[str, Any] = {}
+        extra: dict[str, Any] = {}
+        if client_id is not None:
+            params["clientid"] = client_id
+            extra["client_id"] = client_id
+
+        response = await self._authenticated_get(
+            url=url, params=params, action=action, extra=extra
+        )
+        raw_items = _extract_collection(response.json(), key="Jobs")
+        jobs = [_parse_job(item) for item in raw_items]
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "count": len(jobs),
+                **extra,
+            },
+        )
+        await self._session.commit()
+        return jobs
+
+    async def list_invoices(
+        self, *, client_id: str | None = None
+    ) -> list[XPMInvoice]:
+        """List XPM invoices, optionally scoped to one client."""
+        if client_id is not None and not client_id:
+            raise ValueError("client_id must be non-empty when provided")
+
+        action = "xpm.invoices.list"
+        url = f"{_API_BASE}/{_INVOICES_LIST_PATH}"
+        params: dict[str, Any] = {}
+        extra: dict[str, Any] = {}
+        if client_id is not None:
+            params["clientid"] = client_id
+            extra["client_id"] = client_id
+
+        response = await self._authenticated_get(
+            url=url, params=params, action=action, extra=extra
+        )
+        raw_items = _extract_collection(response.json(), key="Invoices")
+        invoices = [_parse_invoice(item) for item in raw_items]
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "count": len(invoices),
+                **extra,
+            },
+        )
+        await self._session.commit()
+        return invoices
+
+    async def get_invoice(self, invoice_id: str) -> XPMInvoice:
+        """Fetch one XPM invoice by id.
+
+        Raises:
+            ConnectorNotFound: 404 (invoice deleted or never existed).
+            ConnectorAuthError, ConnectorRateLimited, ConnectorTransient.
+            ValueError: ``invoice_id`` is empty.
+        """
+        if not invoice_id:
+            raise ValueError("invoice_id must be non-empty")
+
+        action = "xpm.invoices.get"
+        url = f"{_API_BASE}/{_INVOICE_GET_PATH}/{quote(invoice_id, safe='')}"
+        extra: dict[str, Any] = {"invoice_id": invoice_id}
+
+        response = await self._authenticated_get(
+            url=url, params={}, action=action, extra=extra,
+            allow_not_found=True,
+        )
+        invoice = _parse_invoice(
+            _extract_single(response.json(), key="Invoice")
+        )
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "invoice_id": invoice_id,
+            },
+        )
+        await self._session.commit()
+        return invoice
+
+    async def list_relationships(
+        self, client_id: str
+    ) -> list[XPMRelationship]:
+        """List relationship edges anchored on ``client_id``.
+
+        Phase 4's KG populator uses this for each client to build the
+        directed edges (director_of, trustee_of, beneficiary_of, etc.).
+        """
+        if not client_id:
+            raise ValueError("client_id must be non-empty")
+
+        action = "xpm.relationships.list"
+        url = f"{_API_BASE}/{_RELATIONSHIPS_LIST_PATH}"
+        params: dict[str, Any] = {"clientid": client_id}
+        extra: dict[str, Any] = {"client_id": client_id}
+
+        response = await self._authenticated_get(
+            url=url, params=params, action=action, extra=extra
+        )
+        raw_items = _extract_collection(response.json(), key="Relationships")
+        rels = [_parse_relationship(item) for item in raw_items]
+
+        await append_audit(
+            self._session,
+            firm_id=str(self._firm.id),
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "client_id": client_id,
+                "count": len(rels),
+            },
+        )
+        await self._session.commit()
+        return rels
 
     async def _authenticated_get(
         self,
@@ -616,3 +828,61 @@ def _parse_client_record(raw: dict[str, Any]) -> XPMClientRecord:
         created_at=_parse_xpm_datetime(raw["CreatedDate"]),
         modified_at=_parse_xpm_datetime(raw["ModifiedDate"]),
     )
+
+
+def _parse_job(raw: dict[str, Any]) -> XPMJob:
+    return XPMJob(
+        id=str(raw["ID"]),
+        name=raw.get("Name") or "",
+        client_id=str(raw["ClientID"]),
+        state=raw.get("State") or "",
+        created_at=_parse_xpm_datetime(raw["StartDate"]),
+        due_at=_parse_optional_datetime(raw.get("DueDate")),
+        completed_at=_parse_optional_datetime(raw.get("CompletedDate")),
+    )
+
+
+def _parse_invoice(raw: dict[str, Any]) -> XPMInvoice:
+    return XPMInvoice(
+        id=str(raw["ID"]),
+        number=str(raw.get("InvoiceNumber") or ""),
+        client_id=str(raw["ClientID"]),
+        total_amount=_parse_decimal(raw.get("TotalAmount")),
+        total_tax=_parse_decimal(raw.get("TotalTax")),
+        currency=raw.get("Currency") or "AUD",
+        status=raw.get("Status") or "",
+        issued_at=_parse_xpm_datetime(raw["Date"]),
+        due_at=_parse_optional_datetime(raw.get("DueDate")),
+    )
+
+
+def _parse_relationship(raw: dict[str, Any]) -> XPMRelationship:
+    return XPMRelationship(
+        id=str(raw["ID"]),
+        from_client_id=str(raw["FromClientID"]),
+        to_client_id=str(raw["ToClientID"]),
+        relationship_type=raw.get("Type") or "",
+        is_active=bool(raw.get("IsActive", True)),
+    )
+
+
+def _parse_optional_datetime(value: Any) -> _dt.datetime | None:
+    """Return None for missing/null, otherwise parse via _parse_xpm_datetime."""
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return _parse_xpm_datetime(value)
+    return None
+
+
+def _parse_decimal(value: Any) -> Decimal:
+    """Parse a money amount into ``Decimal``. None / empty -> 0."""
+    if value in (None, ""):
+        return Decimal("0")
+    if isinstance(value, str):
+        return Decimal(value)
+    if isinstance(value, int | float):
+        # str() preserves the literal more faithfully than Decimal(float)
+        # which can introduce binary-float artefacts.
+        return Decimal(str(value))
+    return Decimal("0")
