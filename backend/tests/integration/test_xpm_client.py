@@ -27,6 +27,7 @@ from coworker.connectors.exceptions import (
     ConnectorRateLimited,
     ConnectorTransient,
 )
+from coworker.connectors.shadow_mode import ShadowModeBlocked
 from coworker.connectors.xpm_client import (
     XPMClient,
     XPMClientRecord,
@@ -1371,3 +1372,235 @@ def test_pagination_failure_on_second_page_audits_once_and_raises(
     failed = [a for a in audits if a.action == "xpm.clients.list_failed"]
     assert len(failed) == 1
     assert failed[0].payload["reason"] == "xero_5xx"
+
+
+# =========================================================================
+# create_client_note (shadow-guarded write)
+# =========================================================================
+
+
+_CLIENT_NOTE_CREATE_URL = (
+    "https://api.xero.com/practicemanager/3.1/client.api/note/create"
+)
+
+
+def _seed_with_shadow(sm, *, slug: str, shadow_mode: bool) -> uuid.UUID:
+    """Seed a firm with a valid cached token and configurable shadow mode."""
+
+    async def _run() -> uuid.UUID:
+        firm_id = uuid.uuid4()
+        firm_id_str = str(firm_id)
+        async with sm() as session, firm_context(firm_id):
+            session.add(
+                Firm(
+                    id=firm_id,
+                    name="XPM Test Firm",
+                    slug=slug,
+                    shadow_mode=shadow_mode,
+                    xpm_client_id="xpm-client-id",
+                    xpm_account_id="tenant-aaa",
+                    xpm_client_secret_ciphertext=encrypt_str(
+                        "xpm-secret-123", firm_id=firm_id_str
+                    ),
+                    xpm_refresh_token_ciphertext=encrypt_str(
+                        "refresh-tok-1", firm_id=firm_id_str
+                    ),
+                    xpm_access_token_ciphertext=encrypt_str(
+                        "cached-access", firm_id=firm_id_str
+                    ),
+                    xpm_token_expires_at=_dt.datetime.now(_dt.UTC)
+                    + _dt.timedelta(hours=1),
+                )
+            )
+            await session.commit()
+            return firm_id
+
+    return asyncio.run(_run())
+
+
+def test_create_client_note_posts_and_returns_note_id(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            route = rmock.post(_CLIENT_NOTE_CREATE_URL).mock(
+                return_value=httpx.Response(
+                    201, json={"Note": {"ID": "n-7"}}
+                )
+            )
+            note_id = await client.create_client_note(
+                "c-1", "Spoke to client about FY25 BAS"
+            )
+        sent = route.calls.last.request
+        body_str = sent.read().decode()
+        assert "Spoke to client about FY25 BAS" in body_str
+        assert '"ClientID": "c-1"' in body_str or '"ClientID":"c-1"' in body_str
+        return note_id
+
+    note_id = _run_with_firm(sm, firm_id, body)
+    assert note_id == "n-7"
+
+    audits = _audit_entries(sm, firm_id)
+    success = [a for a in audits if a.action == "xpm.clients.create_note"]
+    assert len(success) == 1
+    assert success[0].payload["client_id"] == "c-1"
+    assert success[0].payload["note_id"] == "n-7"
+
+
+def test_create_client_note_in_shadow_mode_blocks_with_no_http(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-shadow-{uuid.uuid4().hex[:8]}", shadow_mode=True
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock():  # no routes — any HTTP attempt fails loudly
+            with pytest.raises(ShadowModeBlocked) as excinfo:
+                await client.create_client_note("c-1", "Should not be sent")
+            assert excinfo.value.action == "xpm.create_client_note"
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    assert not any(a.action == "xpm.clients.create_note" for a in audits)
+    blocked = [
+        a for a in audits if a.action == "shadow_blocked.xpm.create_client_note"
+    ]
+    assert len(blocked) == 1
+
+
+def test_create_client_note_404_raises_not_found(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-404-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(_CLIENT_NOTE_CREATE_URL).mock(
+                return_value=httpx.Response(404)
+            )
+            with pytest.raises(ConnectorNotFound):
+                await client.create_client_note("missing", "x")
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.create_note_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "xero_404"
+    assert failed[0].payload["client_id"] == "missing"
+
+
+def test_create_client_note_401_raises_auth_error(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-401-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(_CLIENT_NOTE_CREATE_URL).mock(
+                return_value=httpx.Response(401)
+            )
+            with pytest.raises(ConnectorAuthError):
+                await client.create_client_note("c-1", "x")
+
+    _run_with_firm(sm, firm_id, body)
+
+
+def test_create_client_note_network_error_raises_transient_and_audits(
+    xpm_environment,
+) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-net-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(_CLIENT_NOTE_CREATE_URL).mock(
+                side_effect=httpx.ConnectError("no net")
+            )
+            with pytest.raises(ConnectorTransient):
+                await client.create_client_note("c-1", "x")
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.create_note_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "network_error"
+
+
+def test_create_client_note_2xx_missing_id_raises_transient(
+    xpm_environment,
+) -> None:
+    """XPM 2xx without a note ID is anomalous — surface as transient."""
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-noid-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with respx.mock(assert_all_called=True) as rmock:
+            rmock.post(_CLIENT_NOTE_CREATE_URL).mock(
+                return_value=httpx.Response(201, json={"Note": {}})
+            )
+            with pytest.raises(ConnectorTransient):
+                await client.create_client_note("c-1", "x")
+
+    _run_with_firm(sm, firm_id, body)
+
+    audits = _audit_entries(sm, firm_id)
+    failed = [a for a in audits if a.action == "xpm.clients.create_note_failed"]
+    assert len(failed) == 1
+    assert failed[0].payload["reason"] == "xero_missing_id"
+
+
+def test_create_client_note_rejects_invalid_inputs(xpm_environment) -> None:
+    sm = xpm_environment["sessionmaker"]
+    created = xpm_environment["created_firm_ids"]
+
+    firm_id = _seed_with_shadow(
+        sm, slug=f"xpm-note-inp-{uuid.uuid4().hex[:8]}", shadow_mode=False
+    )
+    created.append(firm_id)
+
+    async def body(session, firm):
+        client = XPMClient(firm, session=session)
+        with pytest.raises(ValueError):
+            await client.create_client_note("", "x")
+        with pytest.raises(ValueError):
+            await client.create_client_note("c-1", "")
+
+    _run_with_firm(sm, firm_id, body)

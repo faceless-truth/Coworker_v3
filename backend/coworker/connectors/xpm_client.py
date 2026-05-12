@@ -49,6 +49,7 @@ from coworker.connectors.exceptions import (
     ConnectorRateLimited,
     ConnectorTransient,
 )
+from coworker.connectors.shadow_mode import guard_writable
 from coworker.db.models.tenancy import Firm
 from coworker.security.audit import append_audit
 from coworker.security.encryption import decrypt_str, encrypt_str
@@ -90,6 +91,7 @@ _JOBS_LIST_PATH = "jobs.api/list"
 _INVOICES_LIST_PATH = "invoices.api/list"
 _INVOICE_GET_PATH = "invoice.api/get"  # /{invoice_id}
 _RELATIONSHIPS_LIST_PATH = "relationships.api/list"
+_CLIENT_NOTE_CREATE_PATH = "client.api/note/create"
 
 
 class XPMClientRecord(BaseModel):
@@ -463,6 +465,111 @@ class XPMClient:
         )
         await self._session.commit()
         return rels
+
+    async def create_client_note(
+        self, client_id: str, body: str
+    ) -> str:
+        """Create a note on a client's XPM record. First XPM write method.
+
+        Shadow-mode guarded — a firm in shadow mode never produces
+        the side effect; ``guard_writable`` commits a
+        ``shadow_blocked.xpm.create_client_note`` audit row and raises
+        before any HTTP call.
+
+        Args:
+            client_id: target client. Empty raises ``ValueError``.
+            body: plaintext note body. Empty raises ``ValueError``
+                (XPM rejects empty notes anyway, but surfacing as
+                ``ValueError`` here keeps the failure local rather
+                than emitting a Xero 400 audit row that looks like a
+                transient).
+
+        Returns:
+            The new note's id, parsed from XPM's response.
+
+        Raises:
+            ShadowModeBlocked: firm.shadow_mode is True.
+            ConnectorAuthError: 401 / 403 / other unhandled 4xx.
+            ConnectorNotFound: 404 (client doesn't exist).
+            ConnectorRateLimited: 429.
+            ConnectorTransient: 5xx / network error.
+        """
+        if not client_id:
+            raise ValueError("client_id must be non-empty")
+        if not body:
+            raise ValueError("body must be non-empty")
+
+        firm_id_str = str(self._firm.id)
+        action = "xpm.clients.create_note"
+        extra: dict[str, Any] = {"client_id": client_id}
+
+        await guard_writable(
+            self._session,
+            self._firm,
+            action="xpm.create_client_note",
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+        )
+
+        access_token = await self._ensure_access_token()
+        url = f"{_API_BASE}/{_CLIENT_NOTE_CREATE_PATH}"
+        payload = {
+            "ClientID": client_id,
+            "Body": body,
+            "Date": _dt.datetime.now(_dt.UTC)
+            .replace(tzinfo=None)
+            .isoformat(timespec="seconds"),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                response = await http.post(
+                    url,
+                    json=payload,
+                    headers=self._auth_headers(access_token),
+                )
+        except httpx.RequestError as exc:
+            await self._audit_failure(
+                action=action, reason="network_error", extra=extra
+            )
+            raise ConnectorTransient(
+                "network error talking to XPM"
+            ) from exc
+
+        await self._raise_for_xero_status(
+            response,
+            action=action,
+            allow_not_found=True,
+            extra=extra,
+        )
+
+        raw = _extract_single(response.json(), key="Note")
+        note_id = str(raw.get("ID") or raw.get("Id") or "")
+        if not note_id:
+            # XPM returned a 2xx without an id — treat as transient
+            # so callers can retry. This shouldn't happen, but failing
+            # loud beats silently returning an empty string.
+            await self._audit_failure(
+                action=action, reason="xero_missing_id", extra=extra
+            )
+            raise ConnectorTransient(
+                "XPM create_client_note returned no note ID"
+            )
+
+        await append_audit(
+            self._session,
+            firm_id=firm_id_str,
+            actor_type=self._actor_type,
+            actor_id=self._actor_id,
+            action=action,
+            payload={
+                "user_id": self._actor_id,
+                "client_id": client_id,
+                "note_id": note_id,
+            },
+        )
+        await self._session.commit()
+        return note_id
 
     async def _list_all(
         self,
