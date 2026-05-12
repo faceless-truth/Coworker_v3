@@ -23,7 +23,7 @@ codes and headers); Anthropic / XPM / FuseSign translate from their
 own SDKs to the shared ``ConnectorError`` family in their own
 connector modules.
 """
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -46,6 +46,7 @@ async def raise_for_graph_status(
     action: str,
     allow_not_found: bool,
     extra: dict[str, Any] | None = None,
+    actor_type: Literal["user", "system"] = "user",
 ) -> None:
     """Audit + raise the right ConnectorError for a non-2xx Graph response.
 
@@ -57,7 +58,10 @@ async def raise_for_graph_status(
         session: caller's AsyncSession; the failure audit row commits
             on it before raising so the row survives any subsequent
             rollback when FastAPI propagates the exception.
-        firm_id, user_id: identifiers stamped on the audit row.
+        firm_id, user_id: identifiers stamped on the audit row. For
+            ``actor_type="system"`` (background workflows with no
+            signed-in user), ``user_id`` carries a synthetic actor
+            string such as ``"system"``.
         action: dotted action name, e.g. ``graph.mail.get_message``.
             ``_failed`` is appended for the audit action.
         allow_not_found: True for fetch-by-id endpoints where 404 is a
@@ -67,6 +71,9 @@ async def raise_for_graph_status(
             (treated as auth-class for safety).
         extra: optional dict merged into the audit row's payload —
             typically the id of the resource being fetched.
+        actor_type: ``"user"`` (default) for delegated-token calls;
+            ``"system"`` for app-only / background workflows
+            (subscription renewal, SharePoint indexer).
 
     Raises:
         ConnectorNotFound: 404 and ``allow_not_found=True``.
@@ -88,6 +95,7 @@ async def raise_for_graph_status(
             action=action,
             reason="microsoft_404",
             extra=extra,
+            actor_type=actor_type,
         )
         raise ConnectorNotFound(f"Microsoft Graph returned 404 for {action}")
     if status == 401 or status == 403:
@@ -98,6 +106,7 @@ async def raise_for_graph_status(
             action=action,
             reason=f"microsoft_{status}",
             extra=extra,
+            actor_type=actor_type,
         )
         raise ConnectorAuthError(
             f"Microsoft Graph rejected request: HTTP {status}"
@@ -111,6 +120,7 @@ async def raise_for_graph_status(
             action=action,
             reason="microsoft_429",
             extra=extra,
+            actor_type=actor_type,
         )
         raise ConnectorRateLimited(retry_after=retry_after)
     if 500 <= status < 600:
@@ -121,6 +131,7 @@ async def raise_for_graph_status(
             action=action,
             reason="microsoft_5xx",
             extra=extra,
+            actor_type=actor_type,
         )
         raise ConnectorTransient(f"Microsoft Graph returned {status}")
 
@@ -137,6 +148,7 @@ async def raise_for_graph_status(
         action=action,
         reason=f"microsoft_{status}",
         extra=extra,
+        actor_type=actor_type,
     )
     raise ConnectorAuthError(f"Microsoft Graph returned {status}")
 
@@ -149,6 +161,7 @@ async def audit_failure(
     action: str,
     reason: str,
     extra: dict[str, Any] | None = None,
+    actor_type: Literal["user", "system"] = "user",
 ) -> None:
     """Append ``<action>_failed`` with a standard payload and commit.
 
@@ -156,6 +169,13 @@ async def audit_failure(
     rollback in the request scope (FastAPI exception propagation may
     discard the session before it commits). Same pattern as
     ``refresh_access_token``'s failure path in ``graph.auth``.
+
+    ``actor_type`` defaults to ``"user"`` so existing delegated-token
+    callers stay byte-identical. App-only callers pass
+    ``actor_type="system"`` (with ``user_id="system"`` or another
+    synthetic actor id); the audit row's ``actor_type`` column and
+    ``actor_id`` column reflect that, and the payload still carries
+    ``user_id`` for human readability ("system" reads as system).
     """
     payload: dict[str, Any] = {"user_id": user_id, "reason": reason}
     if extra:
@@ -163,7 +183,7 @@ async def audit_failure(
     await append_audit(
         session,
         firm_id=firm_id,
-        actor_type="user",
+        actor_type=actor_type,
         actor_id=user_id,
         action=f"{action}_failed",
         payload=payload,
