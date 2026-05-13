@@ -21,6 +21,7 @@ Plugins are stateless: ``goal`` and ``system_prompt`` are
 classmethods. The PluginRun carries everything the methods need
 to know about the current invocation.
 """
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -84,7 +85,7 @@ class PluginRun:
     """
 
     plugin_name: str
-    firm_id: Any
+    firm_id: uuid.UUID
     trigger: Trigger
     event_data: dict[str, Any]
     config: dict[str, Any] = field(default_factory=dict)

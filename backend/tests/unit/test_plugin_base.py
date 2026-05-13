@@ -3,6 +3,7 @@
 Pure-Python; no DB / HTTP. The plugin base is metadata + dispatch
 shape; tests exercise the validation boundary and registry CRUD.
 """
+import uuid
 from datetime import UTC, datetime
 
 import pytest
@@ -41,7 +42,7 @@ def _minimal_plugin(
 def _minimal_run(plugin_name: str = "test_plugin") -> PluginRun:
     return PluginRun(
         plugin_name=plugin_name,
-        firm_id="firm-uuid",
+        firm_id=uuid.uuid4(),
         trigger="manual",
         event_data={"key": "value"},
         config={},
