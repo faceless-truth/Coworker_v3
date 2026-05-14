@@ -27,9 +27,11 @@ from coworker.orchestrator.builtin_tools.email import (
     EmailCreateDraftInput,
     EmailGetMessageInput,
     EmailMarkAsReadInput,
+    EmailProposeDraftInput,
     _email_create_draft_handler,
     _email_get_message_handler,
     _email_mark_as_read_handler,
+    _email_propose_draft_handler,
 )
 from coworker.orchestrator.context import AgentContext
 from coworker.orchestrator.tools import ToolError
@@ -61,7 +63,10 @@ async def email_env(test_database_url):
 
 
 async def _cleanup_firm(sm, firm_id):
-    tables = ("firms", "users", "audit_log")
+    tables = (
+        "firms", "users", "audit_log", "approval_items",
+        "agent_traces", "agent_trace_steps",
+    )
     async with sm() as session:
         for t in tables:
             await session.execute(
@@ -70,14 +75,14 @@ async def _cleanup_firm(sm, firm_id):
         await session.commit()
     async with sm() as session:
         try:
-            await session.execute(
-                text("DELETE FROM audit_log WHERE firm_id = :id"),
-                {"id": str(firm_id)},
-            )
-            await session.execute(
-                text("DELETE FROM users WHERE firm_id = :id"),
-                {"id": str(firm_id)},
-            )
+            for t in (
+                "agent_trace_steps", "approval_items", "agent_traces",
+                "audit_log", "users",
+            ):
+                await session.execute(
+                    text(f"DELETE FROM {t} WHERE firm_id = :id"),
+                    {"id": str(firm_id)},
+                )
             await session.execute(
                 text("DELETE FROM firms WHERE id = :id"),
                 {"id": str(firm_id)},
@@ -394,10 +399,151 @@ def test_register_builtin_tools_includes_email_tools() -> None:
     names = {t.name for t in reg.all()}
     assert "email_get_message" in names
     assert "email_create_draft" in names
+    assert "email_propose_draft" in names
     assert "email_mark_as_read" in names
 
-    # email_create_draft and email_mark_as_read are side-effect tools.
+    # email_create_draft, email_propose_draft, and email_mark_as_read
+    # are side-effect tools.
     assert reg.get("email_create_draft").side_effect is True
+    assert reg.get("email_propose_draft").side_effect is True
     assert reg.get("email_mark_as_read").side_effect is True
     # email_get_message is read-only.
     assert reg.get("email_get_message").side_effect is False
+
+
+# ===========================================================================
+# Phase 9-5: email_propose_draft
+# ===========================================================================
+
+
+async def _seed_trace(sm, firm_id: uuid.UUID) -> uuid.UUID:
+    """Insert a minimal agent_traces row so approval_items.trace_id
+    FK is satisfied."""
+    from coworker.db.models import AgentTrace
+
+    trace_id = uuid.uuid4()
+    async with sm() as session, firm_context(firm_id):
+        session.add(
+            AgentTrace(
+                id=trace_id, firm_id=firm_id,
+                plugin_name="smart_responder",
+                goal="test goal", status="completed",
+                metadata_={},
+            )
+        )
+        await session.commit()
+    return trace_id
+
+
+async def test_email_propose_draft_writes_approval_item(email_env) -> None:
+    """The handler creates an approval_items row with the right payload
+    shape; no Outlook side effect."""
+    from coworker.db.models import ApprovalItem
+
+    sm = email_env["sm"]
+    firm_id, firm, user = await _seed_firm_and_user(sm)
+    email_env["created"].append(firm_id)
+    trace_id = await _seed_trace(sm, firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        attached_firm = await session.merge(firm)
+        attached_user = await session.merge(user)
+        graph_ctx = GraphContext(
+            firm=attached_firm, user=attached_user,
+            access_token="bearer-test", session=session,
+        )
+        ctx = AgentContext(
+            firm=attached_firm, session=session,
+            anthropic=None,  # type: ignore[arg-type]
+            trace_id=trace_id,
+            graph_ctx=graph_ctx,
+            metadata={"plugin_name": "smart_responder"},
+        )
+        result = await _email_propose_draft_handler(
+            EmailProposeDraftInput(
+                to=["client@example.com"],
+                subject="Re: your query",
+                body_html="<p>Hi Alice,</p><p>Thanks for reaching out.</p>",
+                summary="Reply to Alice — billing question",
+                in_reply_to_message_id="msg-1",
+            ),
+            ctx,
+        )
+        await session.commit()
+
+    assert result["status"] == "pending"
+    assert result["summary"] == "Reply to Alice — billing question"
+    item_id = uuid.UUID(result["approval_item_id"])
+
+    async with sm() as session, firm_context(firm_id):
+        row = (
+            await session.execute(
+                select(ApprovalItem).where(ApprovalItem.id == item_id)
+            )
+        ).scalar_one()
+        assert row.category == "email_draft"
+        assert row.plugin_name == "smart_responder"
+        assert row.payload["from_user_id"] == str(user.id)
+        assert row.payload["to"] == ["client@example.com"]
+        assert row.payload["subject"] == "Re: your query"
+        assert row.payload["in_reply_to_message_id"] == "msg-1"
+        assert row.trace_id == trace_id
+
+
+async def test_email_propose_draft_without_graph_ctx_raises(email_env) -> None:
+    sm = email_env["sm"]
+    firm_id, firm, _ = await _seed_firm_and_user(sm)
+    email_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        attached_firm = await session.merge(firm)
+        ctx = AgentContext(
+            firm=attached_firm, session=session,
+            anthropic=None,  # type: ignore[arg-type]
+            trace_id=uuid.uuid4(),
+            graph_ctx=None,
+        )
+        with pytest.raises(ToolError, match="Graph context"):
+            await _email_propose_draft_handler(
+                EmailProposeDraftInput(
+                    to=["x@y.com"], subject="x",
+                    body_html="<p>x</p>", summary="x",
+                ),
+                ctx,
+            )
+
+
+async def test_email_propose_draft_no_outlook_side_effect(email_env) -> None:
+    """No respx route registered — if the handler tried to call Graph
+    the test would fail. Verifies the propose path is DB-only."""
+    sm = email_env["sm"]
+    firm_id, firm, user = await _seed_firm_and_user(sm)
+    email_env["created"].append(firm_id)
+    trace_id = await _seed_trace(sm, firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        attached_firm = await session.merge(firm)
+        attached_user = await session.merge(user)
+        graph_ctx = GraphContext(
+            firm=attached_firm, user=attached_user,
+            access_token="bearer-test", session=session,
+        )
+        ctx = AgentContext(
+            firm=attached_firm, session=session,
+            anthropic=None,  # type: ignore[arg-type]
+            trace_id=trace_id,
+            graph_ctx=graph_ctx,
+            metadata={"plugin_name": "smart_responder"},
+        )
+        with respx.mock(assert_all_called=False) as rmock:
+            # Any unexpected Graph call would fail — respx blocks
+            # unmocked traffic by default.
+            result = await _email_propose_draft_handler(
+                EmailProposeDraftInput(
+                    to=["x@y.com"], subject="x",
+                    body_html="<p>x</p>", summary="x",
+                ),
+                ctx,
+            )
+            assert rmock.calls.call_count == 0
+        assert result["status"] == "pending"

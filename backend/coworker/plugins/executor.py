@@ -180,6 +180,9 @@ async def execute_plugin(
         embedder=embedder,
         graph_ctx=graph_ctx,
         budget_cents=plugin_cls.cost_budget_cents,
+        # email_propose_draft (and any future approval-queue tool)
+        # stamps the producing plugin's name onto the approval row.
+        metadata={"plugin_name": plugin_cls.name},
     )
 
     return await engine.run(

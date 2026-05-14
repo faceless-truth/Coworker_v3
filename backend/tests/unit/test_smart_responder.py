@@ -118,7 +118,7 @@ def test_goal_includes_workflow_steps() -> None:
     assert "email_get_message" in goal or "preview is enough" in goal
     assert "kg_entity_lookup" in goal
     assert "memory_query" in goal
-    assert "email_create_draft" in goal
+    assert "email_propose_draft" in goal
 
 
 # ---------------------------------------------------------------------------

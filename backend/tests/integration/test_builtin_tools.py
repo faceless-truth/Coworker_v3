@@ -422,6 +422,7 @@ def test_register_builtin_tools_populates_registry() -> None:
         "get_today_date",
         "email_get_message",
         "email_create_draft",
+        "email_propose_draft",
         "email_mark_as_read",
     }
 
@@ -431,7 +432,7 @@ def test_builtin_tools_render_anthropic_definitions() -> None:
     reg = ToolRegistry()
     register_builtin_tools(reg)
     defs = reg.to_anthropic_definitions()
-    assert len(defs) == 8
+    assert len(defs) == 9
     for d in defs:
         assert d["name"]
         assert d["description"]
