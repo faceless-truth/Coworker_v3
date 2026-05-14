@@ -10,7 +10,10 @@ import {
   type ApprovalItem,
   type ApprovalSignature,
 } from "@/api/approval";
+import { HtmlPreview } from "@/components/HtmlPreview";
 import { formatAbsolute, formatRelative } from "@/lib/time";
+
+type BodyView = "preview" | "source";
 
 /**
  * Per-item review surface. Fetches GET /approval/{id}; renders
@@ -196,8 +199,15 @@ function EmailDraftEditor({
   editError: Error | null;
 }) {
   const [draftBody, setDraftBody] = useState<string | null>(null);
+  // Default to the rendered preview — the principal usually wants
+  // to see what the recipient will see, not the HTML source.
+  const [view, setView] = useState<BodyView>("preview");
+
   const currentBody = String(payload.body_html ?? "");
   const isEditing = draftBody !== null;
+  // The view tab applies to whichever string is "live" — the
+  // draft being edited or the persisted body.
+  const liveBody = isEditing ? draftBody : currentBody;
 
   const to = Array.isArray(payload.to)
     ? (payload.to as string[]).join(", ")
@@ -213,26 +223,37 @@ function EmailDraftEditor({
         <dd>{subject}</dd>
       </dl>
       <div>
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <h3 className="text-sm font-medium text-neutral-700">Body</h3>
-          {editable && !isEditing && (
-            <button
-              type="button"
-              onClick={() => setDraftBody(currentBody)}
-              className="text-xs text-blue-700 hover:underline"
-            >
-              edit
-            </button>
-          )}
+          <div className="flex items-center gap-3">
+            <BodyViewToggle view={view} onChange={setView} />
+            {editable && !isEditing && (
+              <button
+                type="button"
+                onClick={() => setDraftBody(currentBody)}
+                className="text-xs text-blue-700 hover:underline"
+              >
+                edit
+              </button>
+            )}
+          </div>
         </div>
-        {isEditing ? (
-          <div className="mt-1 space-y-2">
+        <div className="mt-1 space-y-2">
+          {view === "preview" ? (
+            <HtmlPreview html={liveBody} />
+          ) : isEditing ? (
             <textarea
               value={draftBody}
               onChange={(e) => setDraftBody(e.target.value)}
               rows={12}
               className="block w-full rounded-md border border-neutral-300 p-2 font-mono text-xs"
             />
+          ) : (
+            <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap rounded-md bg-neutral-50 p-3 font-mono text-xs">
+              {currentBody}
+            </pre>
+          )}
+          {isEditing && (
             <div className="flex items-center gap-2">
               <button
                 type="button"
@@ -258,14 +279,43 @@ function EmailDraftEditor({
                 </span>
               )}
             </div>
-          </div>
-        ) : (
-          <pre className="mt-1 max-h-96 overflow-y-auto whitespace-pre-wrap rounded-md bg-neutral-50 p-3 font-mono text-xs">
-            {currentBody}
-          </pre>
-        )}
+          )}
+        </div>
       </div>
     </section>
+  );
+}
+
+function BodyViewToggle({
+  view,
+  onChange,
+}: {
+  view: BodyView;
+  onChange: (view: BodyView) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="body view"
+      className="inline-flex overflow-hidden rounded-md border border-neutral-300 text-xs"
+    >
+      {(["preview", "source"] as BodyView[]).map((v) => (
+        <button
+          key={v}
+          type="button"
+          role="tab"
+          aria-selected={view === v}
+          onClick={() => onChange(v)}
+          className={
+            view === v
+              ? "bg-neutral-900 px-2 py-1 text-white"
+              : "bg-white px-2 py-1 text-neutral-700 hover:bg-neutral-50"
+          }
+        >
+          {v}
+        </button>
+      ))}
+    </div>
   );
 }
 
