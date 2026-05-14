@@ -325,6 +325,228 @@ class AnthropicClient:
             completed_at=_dt.datetime.now(_dt.UTC),
         )
 
+    async def complete_tool_use(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        tools: list[dict[str, Any]],
+        model: str,
+        max_tokens: int,
+        thinking_budget: int | None = None,
+    ) -> "ToolUseResult":
+        """Tool-use completion for the orchestrator.
+
+        Wraps the SDK's tool-use mode with:
+
+        - PII scrubbing on every outgoing text and tool_result content
+          payload. Tool_use blocks the model generated in earlier
+          turns are passed through unchanged — they're either
+          already in placeholder space (from when the user message
+          was scrubbed) or carry no PII.
+        - Placeholder restoration on incoming text and tool_use
+          inputs so the engine's loop sees real data (handlers
+          would otherwise receive placeholders and fail at the
+          connector layer).
+        - The same connector taxonomy as ``complete``
+          (ConnectorAuthError / ConnectorRateLimited /
+          ConnectorTransient).
+        - Token metering when wired.
+
+        Multi-iteration caveat: each call's mapping is local, so a
+        single placeholder ``[EMAIL_001]`` in iteration 1 might
+        appear as ``[EMAIL_005]`` in iteration 2 for the same
+        email. The model handles this gracefully (Claude reads
+        placeholders as opaque tokens), but reflection-heavy
+        plugins that compare across iterations should normalise
+        if precise mapping matters.
+
+        Args:
+            messages: list of Anthropic-shaped messages. Each
+                message's content is either a string (user text)
+                or a list of content blocks
+                ({type: text/tool_use/tool_result}).
+            system: optional system prompt.
+            tools: Anthropic tool definitions
+                (``ToolRegistry.to_anthropic_definitions()``).
+            model: model id; never hardcode at callsites — read
+                from Settings.
+            max_tokens: response cap.
+            thinking_budget: optional extended thinking budget.
+
+        Returns:
+            ``ToolUseResult`` with the response's content blocks
+            (placeholders restored) plus stop_reason, tokens,
+            and model.
+
+        Raises:
+            ConnectorAuthError: 401/403/other unrecoverable 4xx.
+            ConnectorRateLimited: 429, with parsed retry_after.
+            ConnectorTransient: 5xx / timeout / network error.
+            ValueError: empty messages.
+        """
+        if not messages:
+            raise ValueError("messages must contain at least one entry")
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be >= 1")
+
+        scrubbed_messages, mapping = self._scrub_tool_use_messages(messages)
+        scrubbed_system, system_mapping = self._scrub_system(system)
+        if system_mapping:
+            mapping.update(system_mapping)
+
+        create_kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": scrubbed_messages,
+            "tools": tools,
+        }
+        if scrubbed_system is not None:
+            create_kwargs["system"] = scrubbed_system
+        if thinking_budget is not None:
+            if thinking_budget < 1024:
+                raise ValueError(
+                    "thinking_budget must be >= 1024 (Anthropic minimum); "
+                    f"got {thinking_budget}"
+                )
+            if thinking_budget >= max_tokens:
+                raise ValueError(
+                    "thinking_budget must be strictly less than max_tokens "
+                    f"(got thinking_budget={thinking_budget}, "
+                    f"max_tokens={max_tokens})"
+                )
+            create_kwargs["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": thinking_budget,
+            }
+
+        try:
+            response = await self._client.messages.create(**create_kwargs)
+        except anthropic.AuthenticationError as exc:
+            raise ConnectorAuthError(
+                f"Anthropic auth failed: {exc.message}"
+            ) from exc
+        except anthropic.PermissionDeniedError as exc:
+            raise ConnectorAuthError(
+                f"Anthropic permission denied: {exc.message}"
+            ) from exc
+        except anthropic.RateLimitError as exc:
+            retry_after = _parse_retry_after(
+                exc.response.headers.get("Retry-After")
+            )
+            raise ConnectorRateLimited(retry_after=retry_after) from exc
+        except anthropic.APIStatusError as exc:
+            if 500 <= exc.status_code < 600:
+                raise ConnectorTransient(
+                    f"Anthropic returned {exc.status_code}: {exc.message}"
+                ) from exc
+            raise ConnectorAuthError(
+                f"Anthropic returned {exc.status_code}: {exc.message}"
+            ) from exc
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError) as exc:
+            raise ConnectorTransient(
+                f"network/timeout talking to Anthropic: {exc}"
+            ) from exc
+
+        content_blocks = _content_blocks_to_dicts(response.content)
+        if mapping:
+            content_blocks = _restore_placeholders_in_blocks(
+                content_blocks, mapping
+            )
+
+        if self._token_meter is not None:
+            await self._token_meter.record(
+                firm_id=self._firm_id,
+                model=response.model,
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+            )
+
+        return ToolUseResult(
+            content=content_blocks,
+            stop_reason=response.stop_reason or "unknown",
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            model=response.model,
+        )
+
+    def _scrub_tool_use_messages(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Scrub PII in a tool-use messages list.
+
+        Walks each message's content. For string content (plain
+        user text) the whole string is scrubbed. For list content
+        (a mix of text / tool_use / tool_result blocks), each
+        block's text fields are scrubbed individually:
+
+        - ``text`` blocks: scrub the ``text`` field.
+        - ``tool_use`` blocks: passed through unchanged. The model
+          generated these from scrubbed inputs and they're already
+          in placeholder space; touching them risks corrupting the
+          tool dispatch.
+        - ``tool_result`` blocks: scrub the ``content`` field
+          (which contains real data from a tool handler's output).
+          Both string and list shapes for content are handled.
+        - Anything else: passed through unchanged.
+
+        Returns (scrubbed_messages, merged_mapping) where mapping
+        is the union of every per-call scrub's placeholder map.
+        """
+        merged: dict[str, str] = {}
+        scrubbed_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content")
+            if isinstance(content, str):
+                result = self._scrubber.scrub(content)
+                merged.update(result.mapping)
+                scrubbed_messages.append({"role": role, "content": result.text})
+                continue
+            if isinstance(content, list):
+                new_blocks: list[Any] = []
+                for block in content:
+                    new_blocks.append(self._scrub_block(block, merged))
+                scrubbed_messages.append({"role": role, "content": new_blocks})
+                continue
+            # Unknown content shape — pass through.
+            scrubbed_messages.append(msg)
+        return scrubbed_messages, merged
+
+    def _scrub_block(
+        self, block: Any, mapping_accumulator: dict[str, str]
+    ) -> Any:
+        """Scrub PII in one content block. Mutates the accumulator."""
+        if not isinstance(block, dict):
+            return block
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text", "")
+            if isinstance(text, str) and text:
+                result = self._scrubber.scrub(text)
+                mapping_accumulator.update(result.mapping)
+                new_block = dict(block)
+                new_block["text"] = result.text
+                return new_block
+            return block
+        if block_type == "tool_result":
+            new_block = dict(block)
+            inner = new_block.get("content")
+            if isinstance(inner, str) and inner:
+                result = self._scrubber.scrub(inner)
+                mapping_accumulator.update(result.mapping)
+                new_block["content"] = result.text
+            elif isinstance(inner, list):
+                new_inner: list[Any] = []
+                for sub in inner:
+                    new_inner.append(
+                        self._scrub_block(sub, mapping_accumulator)
+                    )
+                new_block["content"] = new_inner
+            return new_block
+        # tool_use / image / anything else: pass through.
+        return block
+
     def _scrub_messages(
         self, messages: list[CompletionMessage]
     ) -> tuple[list[dict[str, Any]], dict[str, str]]:
@@ -350,9 +572,10 @@ def _render_text(content: Any) -> str:
     """Concatenate text blocks from an Anthropic Message response.
 
     Phase 3B-1 only handles ``text`` blocks. Tool-use / tool-result
-    blocks land in Phase 5 alongside the orchestrator. Anything that
-    isn't a recognised text block is silently skipped — the orchestrator
-    will inspect the raw response separately when it needs that.
+    blocks are handled separately by ``complete_tool_use`` /
+    ``_content_blocks_to_dicts``. Anything that isn't a recognised
+    text block here is silently skipped — the tool-use path
+    inspects the raw response separately when it needs that.
     """
     pieces: list[str] = []
     for block in content:
@@ -360,6 +583,124 @@ def _render_text(content: Any) -> str:
         if block_type == "text":
             pieces.append(block.text)
     return "".join(pieces)
+
+
+def _content_blocks_to_dicts(content: Any) -> list[dict[str, Any]]:
+    """Convert an Anthropic SDK content list to dict-shaped blocks.
+
+    The SDK returns ``TextBlock`` / ``ToolUseBlock`` (and similar)
+    objects with attribute access. The orchestrator's engine
+    expects plain dicts so the trace JSONB columns store the
+    payload verbatim. Unknown block types are preserved with
+    whatever attributes they expose plus their ``type``.
+    """
+    blocks: list[dict[str, Any]] = []
+    for block in content:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            blocks.append({"type": "text", "text": getattr(block, "text", "")})
+        elif block_type == "tool_use":
+            blocks.append(
+                {
+                    "type": "tool_use",
+                    "id": getattr(block, "id", ""),
+                    "name": getattr(block, "name", ""),
+                    "input": getattr(block, "input", {}) or {},
+                }
+            )
+        elif block_type == "thinking":
+            # Extended-thinking blocks carry the model's
+            # internal reasoning. They're not scrubbed because
+            # they only contain placeholders (the model thought
+            # against scrubbed input) and aren't sent to tools.
+            blocks.append(
+                {
+                    "type": "thinking",
+                    "thinking": getattr(block, "thinking", ""),
+                    "signature": getattr(block, "signature", ""),
+                }
+            )
+        else:
+            # Fallback: a future block type. Preserve the type
+            # field so callers can decide; the engine ignores
+            # blocks it doesn't recognise.
+            blocks.append({"type": block_type or "unknown"})
+    return blocks
+
+
+def _restore_placeholders_in_blocks(
+    blocks: list[dict[str, Any]], mapping: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Walk content blocks and restore PII placeholders.
+
+    - ``text`` blocks: ``text`` field gets each placeholder
+      replaced with its original value.
+    - ``tool_use`` blocks: walk ``input`` recursively and
+      replace placeholders in every string value. Lists and
+      nested dicts are traversed; non-string values pass
+      through unchanged.
+    - Other block types pass through unchanged.
+
+    Returns a new list; original blocks are not mutated.
+    """
+    if not mapping:
+        return list(blocks)
+    restored: list[dict[str, Any]] = []
+    for block in blocks:
+        if block.get("type") == "text":
+            new_block = dict(block)
+            new_block["text"] = _restore_in_string(
+                str(block.get("text", "")), mapping
+            )
+            restored.append(new_block)
+        elif block.get("type") == "tool_use":
+            new_block = dict(block)
+            new_block["input"] = _restore_in_value(
+                block.get("input", {}), mapping
+            )
+            restored.append(new_block)
+        else:
+            restored.append(block)
+    return restored
+
+
+def _restore_in_string(text: str, mapping: dict[str, str]) -> str:
+    for placeholder, original in mapping.items():
+        text = text.replace(placeholder, original)
+    return text
+
+
+def _restore_in_value(value: Any, mapping: dict[str, str]) -> Any:
+    """Recursively restore placeholders in any JSON-like value."""
+    if isinstance(value, str):
+        return _restore_in_string(value, mapping)
+    if isinstance(value, list):
+        return [_restore_in_value(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _restore_in_value(sub, mapping)
+            for key, sub in value.items()
+        }
+    return value
+
+
+@dataclass(frozen=True)
+class ToolUseResult:
+    """Result of a single ``complete_tool_use`` call.
+
+    Shape matches ``coworker.orchestrator.engine.ModelCallResult``
+    so AnthropicClient.complete_tool_use is a drop-in ``ModelCaller``
+    for the engine. ``content`` carries the response's content
+    blocks as plain dicts with PII placeholders already restored;
+    the engine writes them verbatim into the trace and consumes
+    them for the loop's next iteration.
+    """
+
+    content: list[dict[str, Any]]
+    stop_reason: str
+    input_tokens: int
+    output_tokens: int
+    model: str
 
 
 def _parse_retry_after(header: str | None) -> float | None:
