@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodic missed-notification backfill for CoWorker v3
+Requires=coworker-backfill.service
+
+[Timer]
+# Run every 5 minutes. Microsoft retains undelivered notifications
+# briefly, and the backfill function itself paginates to 100
+# messages per row per tick — so we don't want to fall hours behind.
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
