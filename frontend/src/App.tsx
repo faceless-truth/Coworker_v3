@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { CurrentUserProvider } from "@/auth/CurrentUserProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
+import { ApprovalDetailPage } from "@/pages/ApprovalDetailPage";
 import { ApprovalQueuePage } from "@/pages/ApprovalQueuePage";
 import { HealthPage } from "@/pages/HealthPage";
 import { SignInPage } from "@/pages/SignInPage";
@@ -14,8 +15,8 @@ import { SignInPage } from "@/pages/SignInPage";
  * - ``/`` redirects to ``/approval`` — the principal's daily
  *   landing.
  * - ``/health`` is kept for ops/debug sanity (Phase 10-1).
- * - ``/approval`` lists pending items (Phase 10-3); the
- *   detail page at ``/approval/:id`` lands in Phase 10-4.
+ * - ``/approval`` lists pending items (Phase 10-3);
+ *   ``/approval/:id`` is the per-item review surface (Phase 10-4).
  */
 export function App() {
   return (
@@ -31,6 +32,14 @@ export function App() {
           element={
             <RequireAuth>
               <ApprovalQueuePage />
+            </RequireAuth>
+          }
+        />
+        <Route
+          path="/approval/:id"
+          element={
+            <RequireAuth>
+              <ApprovalDetailPage />
             </RequireAuth>
           }
         />
