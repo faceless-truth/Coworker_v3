@@ -471,3 +471,125 @@ async def test_two_person_reject_is_terminal_on_first_call(
         await session.commit()
 
     assert rejected.status == "rejected"
+
+
+# ===========================================================================
+# Phase 9-7: confidence-based auto-approve
+# ===========================================================================
+
+
+def _draft_with_confidence(confidence: float) -> CreateApprovalInput:
+    return CreateApprovalInput(
+        plugin_name="smart_responder",
+        category="email_draft",
+        summary="High-confidence draft",
+        payload={
+            "from_user_id": str(uuid.uuid4()),
+            "to": ["c@example.com"],
+            "subject": "x",
+            "body_html": "<p>x</p>",
+        },
+        confidence=confidence,
+        auto_approve_threshold=0.85,
+    )
+
+
+async def test_above_threshold_auto_approves(approval_env) -> None:
+    sm = approval_env["sm"]
+    firm_id, _ = await _seed_firm_user(sm)
+    approval_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        row = await create_approval(
+            session, firm_id, input=_draft_with_confidence(0.92),
+        )
+        await session.commit()
+
+    assert row.status == "approved"
+    assert row.decided_at is not None
+    assert row.decided_by_user_id is None  # system, not a user
+    assert len(row.approval_signatures) == 1
+    sig = row.approval_signatures[0]
+    assert sig["user_id"] is None
+    assert "0.92" in sig["notes"]
+    assert "auto-approved" in row.decision_notes
+
+
+async def test_at_threshold_auto_approves(approval_env) -> None:
+    """Exactly at threshold counts as eligible (>= not >)."""
+    sm = approval_env["sm"]
+    firm_id, _ = await _seed_firm_user(sm)
+    approval_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        row = await create_approval(
+            session, firm_id, input=_draft_with_confidence(0.85),
+        )
+        await session.commit()
+
+    assert row.status == "approved"
+
+
+async def test_below_threshold_stays_pending(approval_env) -> None:
+    sm = approval_env["sm"]
+    firm_id, _ = await _seed_firm_user(sm)
+    approval_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        row = await create_approval(
+            session, firm_id, input=_draft_with_confidence(0.7),
+        )
+        await session.commit()
+
+    assert row.status == "pending"
+    assert row.confidence == 0.7
+    assert row.approval_signatures == []
+
+
+async def test_missing_confidence_stays_pending(approval_env) -> None:
+    """No self-rating -> never auto-approve, even with low threshold."""
+    sm = approval_env["sm"]
+    firm_id, _ = await _seed_firm_user(sm)
+    approval_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        row = await create_approval(
+            session, firm_id,
+            input=CreateApprovalInput(
+                plugin_name="smart_responder",
+                category="email_draft",
+                summary="No self-rating",
+                payload={"to": ["c@example.com"]},
+                confidence=None,
+                auto_approve_threshold=0.0,
+            ),
+        )
+        await session.commit()
+
+    assert row.status == "pending"
+    assert row.confidence is None
+
+
+async def test_two_person_overrides_auto_approve(approval_env) -> None:
+    """High confidence + two-person category -> still requires signatures."""
+    sm = approval_env["sm"]
+    firm_id, _ = await _seed_firm_user(sm)
+    approval_env["created"].append(firm_id)
+
+    async with sm() as session, firm_context(firm_id):
+        row = await create_approval(
+            session, firm_id,
+            input=CreateApprovalInput(
+                plugin_name="engagement_letter",
+                category="engagement_letter",
+                summary="High-confidence engagement letter",
+                payload={"client_name": "Acme"},
+                confidence=0.99,
+                auto_approve_threshold=0.5,
+            ),
+        )
+        await session.commit()
+
+    assert row.status == "pending"
+    assert row.required_approvals == 2
+    assert row.approval_signatures == []

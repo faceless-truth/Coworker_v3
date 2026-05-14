@@ -64,6 +64,7 @@ class ApprovalItemResponse(BaseModel):
     last_edited_by_user_id: uuid.UUID | None
     required_approvals: int
     approval_signatures: list[dict[str, Any]]
+    confidence: float | None
     created_at: _dt.datetime
     updated_at: _dt.datetime
 
@@ -84,6 +85,7 @@ class ApprovalItemResponse(BaseModel):
             last_edited_by_user_id=row.last_edited_by_user_id,
             required_approvals=row.required_approvals,
             approval_signatures=list(row.approval_signatures or []),
+            confidence=row.confidence,
             created_at=row.created_at,
             updated_at=row.updated_at,
         )

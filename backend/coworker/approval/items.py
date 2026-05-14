@@ -70,6 +70,14 @@ class CreateApprovalInput:
     # Override the category default. ``None`` (the usual case) lets
     # the helper look up the firm-wide setting.
     required_approvals: int | None = None
+    # Plugin's self-rated confidence in this proposal, 0.0-1.0.
+    # Combined with the firm's auto-approve threshold to decide
+    # whether the row is born ``pending`` or ``approved``. Leave
+    # None for plugins that don't self-rate yet.
+    confidence: float | None = None
+    # Override the firm-wide auto-approve threshold. Tests pin it;
+    # production uses the firm or settings default.
+    auto_approve_threshold: float | None = None
 
 
 async def create_approval(
@@ -78,18 +86,44 @@ async def create_approval(
     *,
     input: CreateApprovalInput,
 ) -> ApprovalItem:
-    """Insert a new ``pending`` row. Caller commits.
+    """Insert a new ``pending`` row (or ``approved`` on auto-approve).
 
     ``session`` must already be inside ``firm_context(firm_id)``;
-    RLS rejects the INSERT otherwise. ``required_approvals`` is
-    set from the firm's ``TWO_PERSON_REQUIRED_CATEGORIES`` config
-    unless the caller overrides it explicitly.
+    RLS rejects the INSERT otherwise.
+
+    Auto-approve conditions (Phase 9-7): the row is created
+    ``approved`` instead of ``pending`` when ALL of:
+
+    - ``input.confidence`` is set (plugin self-rated).
+    - ``confidence >= threshold`` (firm-level threshold, or the
+      explicit override).
+    - ``required_approvals == 1`` (two-person categories never
+      auto-approve — the high-sensitivity guard wins).
+
+    Auto-approved rows record a synthetic system signature with
+    ``user_id=None`` so the dispatch sweep and audit can tell
+    "system decided" from "human decided".
+
+    Caller commits.
     """
     required = (
         input.required_approvals
         if input.required_approvals is not None
         else _required_approvals_for(input.category)
     )
+    threshold = (
+        input.auto_approve_threshold
+        if input.auto_approve_threshold is not None
+        else get_settings().DEFAULT_AUTO_APPROVE_THRESHOLD
+    )
+
+    eligible_for_auto = (
+        required == 1
+        and input.confidence is not None
+        and input.confidence >= threshold
+    )
+
+    now = _dt.datetime.now(_dt.UTC)
     row = ApprovalItem(
         firm_id=firm_id,
         trace_id=input.trace_id,
@@ -97,9 +131,24 @@ async def create_approval(
         category=input.category,
         summary=input.summary,
         payload=input.payload,
-        status="pending",
+        status="approved" if eligible_for_auto else "pending",
         required_approvals=required,
-        approval_signatures=[],
+        approval_signatures=(
+            [{
+                "user_id": None,
+                "signed_at": now.isoformat(),
+                "notes": f"auto: confidence={input.confidence:.2f}",
+            }]
+            if eligible_for_auto
+            else []
+        ),
+        confidence=input.confidence,
+        decided_at=now if eligible_for_auto else None,
+        decision_notes=(
+            f"auto-approved (confidence={input.confidence:.2f} "
+            f">= threshold={threshold:.2f})"
+            if eligible_for_auto else None
+        ),
     )
     session.add(row)
     await session.flush()

@@ -105,6 +105,13 @@ class ApprovalItem(Base):
         JSONB, nullable=False, default=list, server_default="[]",
     )
 
+    # Plugin's self-rated confidence (Phase 9-7). NULL means the
+    # producing plugin chose not to self-rate, in which case the
+    # row always routes to human approval. When set, the helper
+    # auto-approves at insert time if confidence >= threshold and
+    # the category isn't two-person.
+    confidence: Mapped[float | None] = mapped_column()
+
     created_at: Mapped[_dt.datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

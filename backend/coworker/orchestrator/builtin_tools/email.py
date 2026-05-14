@@ -204,6 +204,17 @@ class EmailProposeDraftInput(BaseModel):
             "PATCH path so the eventual draft threads properly."
         ),
     )
+    confidence: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description=(
+            "Self-rated confidence in this draft, 0.0 to 1.0. When "
+            "above the firm's auto-approve threshold (and the "
+            "category isn't two-person), the row is born ``approved`` "
+            "and the principal never sees it. Use low values "
+            "(0.0-0.6) when uncertain — those always route to human "
+            "review."
+        ),
+    )
 
 
 async def _email_propose_draft_handler(
@@ -232,6 +243,7 @@ async def _email_propose_draft_handler(
             summary=inp.summary,
             payload=payload,
             trace_id=ctx.trace_id,
+            confidence=inp.confidence,
         ),
     )
     return {
