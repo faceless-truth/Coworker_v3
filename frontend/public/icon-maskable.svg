@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="CoWorker">
+  <!-- Maskable: the entire 512x512 is the icon background, the
+       Android launcher crops to a circle / squircle / squircle. The
+       "safe zone" is a 80%-radius circle at center (≈ 204px radius
+       from 256,256). The "cw" glyph sits well inside that. -->
+  <rect width="512" height="512" fill="#171717"/>
+  <text x="256" y="312" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="220" font-weight="600" text-anchor="middle" fill="#ffffff" letter-spacing="-10">cw</text>
+</svg>
