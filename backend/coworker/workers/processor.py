@@ -184,7 +184,10 @@ async def _run_one_plugin(
         ).scalar_one()
 
         graph_ctx: GraphContext | None = None
-        if event.trigger == "email_received":
+        if event.trigger in ("email_received", "calendar_event"):
+            # Both triggers carry a ``resource`` of the shape
+            # ``users/{azure_object_id}/...``. The mailbox-owner
+            # lookup is identical for either.
             graph_ctx = await _resolve_graph_ctx_for_email(
                 session, firm=firm, event=event
             )

@@ -24,6 +24,7 @@ from coworker.db.firms import list_active_firm_ids
 from coworker.db.models import Firm, GraphSubscription, User
 from coworker.db.session import firm_context
 from coworker.graph.subscription_bootstrap import (
+    CALENDAR_EVENTS_RESOURCE_TEMPLATE,
     INBOX_MESSAGES_RESOURCE_TEMPLATE,
     ensure_subscription,
 )
@@ -31,6 +32,15 @@ from coworker.graph.subscriptions import (
     AppGraphContext,
     delete_subscription,
     graph_app_context,
+)
+
+# Per-user resource templates the sweep bootstraps. Adding a new
+# template here (e.g. tasks) requires no other code changes —
+# the webhook receiver discriminates triggers via the
+# ``RESOURCE_TRIGGER_MAP`` in subscription_bootstrap.
+_USER_RESOURCE_TEMPLATES: tuple[str, ...] = (
+    INBOX_MESSAGES_RESOURCE_TEMPLATE,
+    CALENDAR_EVENTS_RESOURCE_TEMPLATE,
 )
 
 
@@ -215,44 +225,50 @@ async def _sweep_user(
     now: _dt.datetime,
     result: SweepResult,
 ) -> None:
-    """Run ensure_subscription for one user's inbox."""
-    result.users_seen += 1
-    resource = INBOX_MESSAGES_RESOURCE_TEMPLATE.format(
-        azure_object_id=user.azure_object_id,
-    )
-    try:
-        outcome = await ensure_subscription(
-            session=session,
-            ctx=ctx,
-            user=user,
-            resource=resource,
-            notification_url=notification_url,
-            now=now,
-        )
-    except ConnectorError as exc:
-        logger.warning(
-            "subscription sweep user failed user_id={} err={}",
-            user.id, exc,
-        )
-        result.user_errors.append(
-            f"{user.id}: {type(exc).__name__}: {exc}"
-        )
-        return
-    except Exception as exc:
-        logger.exception(
-            "subscription sweep user unexpected error user_id={}",
-            user.id,
-        )
-        result.user_errors.append(
-            f"{user.id}: {type(exc).__name__}: {exc}"
-        )
-        return
+    """Run ensure_subscription for every resource template per user.
 
-    logger.info(
-        "subscription sweep user_id={} action={} sub_id={}",
-        user.id, outcome.action, outcome.row.subscription_id,
-    )
-    result.record_action(outcome.action)
+    One user produces N subscriptions: inbox messages + calendar
+    events today (Phase 12-6). Each template is bootstrapped
+    independently — a Graph failure on one resource doesn't
+    prevent the next from being attempted.
+    """
+    result.users_seen += 1
+    for template in _USER_RESOURCE_TEMPLATES:
+        resource = template.format(azure_object_id=user.azure_object_id)
+        try:
+            outcome = await ensure_subscription(
+                session=session,
+                ctx=ctx,
+                user=user,
+                resource=resource,
+                notification_url=notification_url,
+                now=now,
+            )
+        except ConnectorError as exc:
+            logger.warning(
+                "subscription sweep user failed user_id={} resource={} err={}",
+                user.id, resource, exc,
+            )
+            result.user_errors.append(
+                f"{user.id} {resource}: {type(exc).__name__}: {exc}"
+            )
+            continue
+        except Exception as exc:
+            logger.exception(
+                "subscription sweep user unexpected error user_id={} "
+                "resource={}",
+                user.id, resource,
+            )
+            result.user_errors.append(
+                f"{user.id} {resource}: {type(exc).__name__}: {exc}"
+            )
+            continue
+
+        logger.info(
+            "subscription sweep user_id={} resource={} action={} sub_id={}",
+            user.id, resource, outcome.action, outcome.row.subscription_id,
+        )
+        result.record_action(outcome.action)
 
 
 async def _delete_orphan_subscription(

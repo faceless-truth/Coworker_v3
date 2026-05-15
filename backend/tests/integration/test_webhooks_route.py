@@ -595,3 +595,77 @@ def test_lifecycle_with_wrong_clientstate_is_rejected(webhook_env) -> None:
             ).scalar_one_or_none()
             return row is not None
     assert asyncio.run(_row_survives())
+
+
+# ===========================================================================
+# Phase 12-6: calendar_event trigger
+# ===========================================================================
+
+
+def test_calendar_resource_notification_fires_calendar_event(
+    webhook_env,
+) -> None:
+    """A subscription on /events fires the ``calendar_event`` trigger
+    rather than ``email_received``. The webhook discriminates by the
+    stored subscription's resource path."""
+    slug = webhook_env["slug"]
+    firm_id = webhook_env["firm_id"]
+    asyncio.run(_seed_subscription(
+        webhook_env["sm"], firm_id,
+        subscription_id="sub-cal",
+        client_state="cal-secret",
+        resource="users/oid-x/events",
+    ))
+
+    body = {
+        "value": [{
+            "subscriptionId": "sub-cal",
+            "clientState": "cal-secret",
+            "changeType": "updated",
+            "resource": "users/oid-x/events/ev-123",
+            "resourceData": {
+                "@odata.type": "#Microsoft.Graph.Event",
+                "id": "ev-123",
+            },
+        }],
+    }
+    client = TestClient(app)
+    resp = client.post(f"/webhooks/graph/{slug}", json=body)
+    assert resp.status_code == 202
+
+    events = _queue_contents()
+    assert len(events) == 1
+    assert events[0]["trigger"] == "calendar_event"
+    assert events[0]["event_data"]["message_id"] == "ev-123"
+    assert events[0]["event_data"]["subscription_id"] == "sub-cal"
+    assert (
+        events[0]["event_data"]["resource"]
+        == "users/oid-x/events/ev-123"
+    )
+
+
+def test_unknown_resource_type_is_rejected(webhook_env) -> None:
+    """A subscription on a resource type we don't have a trigger for
+    is dropped at the webhook (logged + 202'd, no enqueue)."""
+    slug = webhook_env["slug"]
+    firm_id = webhook_env["firm_id"]
+    asyncio.run(_seed_subscription(
+        webhook_env["sm"], firm_id,
+        subscription_id="sub-tasks",
+        client_state="task-secret",
+        resource="users/oid-x/todo/lists/inbox/tasks",
+    ))
+
+    body = {
+        "value": [{
+            "subscriptionId": "sub-tasks",
+            "clientState": "task-secret",
+            "changeType": "created",
+            "resource": "users/oid-x/todo/lists/inbox/tasks/t-1",
+            "resourceData": {"id": "t-1"},
+        }],
+    }
+    client = TestClient(app)
+    resp = client.post(f"/webhooks/graph/{slug}", json=body)
+    assert resp.status_code == 202
+    assert _queue_contents() == []

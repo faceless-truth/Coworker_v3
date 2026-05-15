@@ -50,6 +50,22 @@ INBOX_MESSAGES_RESOURCE_TEMPLATE = (
     "users/{azure_object_id}/mailFolders('Inbox')/messages"
 )
 
+# Graph resource path for the user's calendar events. Phase 12-6
+# subscribes to this so calendar mutations fire the
+# ``calendar_event`` trigger end-to-end.
+CALENDAR_EVENTS_RESOURCE_TEMPLATE = "users/{azure_object_id}/events"
+
+
+# Maps a Microsoft Graph resource path's tail to the
+# ``Trigger`` literal the webhook receiver enqueues. The
+# webhook discriminates by inspecting the notification's
+# ``resource`` field; if no entry matches the event is dropped
+# at the receiver layer (logged + 202'd).
+RESOURCE_TRIGGER_MAP: dict[str, str] = {
+    "/messages": "email_received",
+    "/events": "calendar_event",
+}
+
 
 class EnsureOutcome(NamedTuple):
     """Result of ``ensure_subscription``.

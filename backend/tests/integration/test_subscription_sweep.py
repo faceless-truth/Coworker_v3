@@ -158,13 +158,43 @@ def _subscription_response(
     }
 
 
+def _make_subscription_dispatcher(expiry: _dt.datetime):
+    """Return a respx side_effect that yields a unique sub_id per POST.
+
+    Phase 12-6 sweeps two resources per user (inbox + calendar), so
+    a single hardcoded return value would collide on the global
+    UNIQUE(subscription_id) constraint. The dispatcher reads the
+    request body's ``resource`` to echo back something sensible.
+    """
+    import json
+    counter = {"n": 0}
+
+    def _dispatch(request: httpx.Request) -> httpx.Response:
+        counter["n"] += 1
+        body = json.loads(request.read())
+        return httpx.Response(
+            201,
+            json=_subscription_response(
+                sub_id=f"sub-{counter['n']}",
+                resource=body["resource"],
+                expiration=expiry,
+            ),
+        )
+
+    return _dispatch
+
+
 # ===========================================================================
 # Tests
 # ===========================================================================
 
 
 async def test_sweep_visits_active_users_only(sweep_env) -> None:
-    """A passive user (is_active_processor=False) is skipped."""
+    """A passive user (is_active_processor=False) is skipped.
+
+    Each active user produces N subscriptions (inbox + calendar
+    per Phase 12-6); passive users produce none.
+    """
     sm = sweep_env["sm"]
     firm_id = await _seed_firm(sm, slug="sweep-a")
     sweep_env["created"].append(firm_id)
@@ -181,16 +211,7 @@ async def test_sweep_visits_active_users_only(sweep_env) -> None:
             return_value=httpx.Response(200, json=_token_response()),
         )
         post = rmock.post(_SUBS_URL).mock(
-            return_value=httpx.Response(
-                201,
-                json=_subscription_response(
-                    sub_id="sub-1",
-                    resource=(
-                        "users/oid-active/mailFolders('Inbox')/messages"
-                    ),
-                    expiration=expiry,
-                ),
-            ),
+            side_effect=_make_subscription_dispatcher(expiry),
         )
 
         result = await sweep_subscriptions(
@@ -202,8 +223,9 @@ async def test_sweep_visits_active_users_only(sweep_env) -> None:
 
     assert result.firms_seen == 1
     assert result.users_seen == 1
-    assert result.actions == {"created": 1}
-    assert post.call_count == 1
+    # 2 resources per user (inbox + calendar).
+    assert result.actions == {"created": 2}
+    assert post.call_count == 2
     assert active_user_id  # silence linter
 
 
@@ -260,17 +282,16 @@ async def test_sweep_continues_after_per_user_graph_failure(sweep_env) -> None:
     now = _dt.datetime(2026, 5, 14, 12, 0, tzinfo=_dt.UTC)
     expiry = now + DEFAULT_SUBSCRIPTION_TTL
 
-    def _dispatch(request):
-        body = request.read().decode()
-        if "oid-bad" in body:
+    import json
+    def _dispatch(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.read())
+        if "oid-bad" in body["resource"]:
             return httpx.Response(503, json={"error": "transient"})
         return httpx.Response(
             201,
             json=_subscription_response(
                 sub_id=f"sub-{uuid.uuid4().hex[:6]}",
-                resource=(
-                    "users/oid-good/mailFolders('Inbox')/messages"
-                ),
+                resource=body["resource"],
                 expiration=expiry,
             ),
         )
@@ -290,13 +311,21 @@ async def test_sweep_continues_after_per_user_graph_failure(sweep_env) -> None:
 
     assert result.firms_seen == 1
     assert result.users_seen == 2
-    assert result.actions == {"created": 1}
-    assert len(result.user_errors) == 1
-    assert "ConnectorTransient" in result.user_errors[0]
+    # oid-good produces 2 successful subs (inbox + calendar);
+    # oid-bad fails both (the 503 path).
+    assert result.actions == {"created": 2}
+    assert len(result.user_errors) == 2
+    assert all(
+        "ConnectorTransient" in err for err in result.user_errors
+    )
 
 
 async def test_sweep_visits_multiple_firms(sweep_env) -> None:
-    """Two active firms each get their users subscribed."""
+    """Two active firms each get their users subscribed.
+
+    Each user gets 2 subscriptions (inbox + calendar), so 2 firms ×
+    1 user × 2 resources = 4 POSTs total.
+    """
     sm = sweep_env["sm"]
     firm_a = await _seed_firm(sm, slug="firm-a")
     sweep_env["created"].append(firm_a)
@@ -309,14 +338,15 @@ async def test_sweep_visits_multiple_firms(sweep_env) -> None:
     expiry = now + DEFAULT_SUBSCRIPTION_TTL
 
     call_count = {"posts": 0}
-
-    def _dispatch(request):
+    import json
+    def _dispatch(request: httpx.Request) -> httpx.Response:
         call_count["posts"] += 1
+        body = json.loads(request.read())
         return httpx.Response(
             201,
             json=_subscription_response(
                 sub_id=f"sub-{call_count['posts']}",
-                resource=f"users/oid-{call_count['posts']}/mailFolders('Inbox')/messages",
+                resource=body["resource"],
                 expiration=expiry,
             ),
         )
@@ -336,8 +366,8 @@ async def test_sweep_visits_multiple_firms(sweep_env) -> None:
 
     assert result.firms_seen == 2
     assert result.users_seen == 2
-    assert result.actions == {"created": 2}
-    assert call_count["posts"] == 2
+    assert result.actions == {"created": 4}
+    assert call_count["posts"] == 4
 
 
 async def test_sweep_empty_base_url_rejected(sweep_env) -> None:
@@ -506,7 +536,11 @@ async def test_sweep_orphan_delete_5xx_keeps_local_row(sweep_env) -> None:
 
 
 async def test_sweep_mixed_active_and_inactive_users(sweep_env) -> None:
-    """Active user gets create/renew; inactive user with sub gets cleanup."""
+    """Active user gets create/renew; inactive user with sub gets cleanup.
+
+    The active user now produces 2 fresh subs (inbox + calendar
+    per Phase 12-6); the inactive user's stale sub gets deleted.
+    """
     from sqlalchemy import select as _select
     sm = sweep_env["sm"]
     firm_id = await _seed_firm(sm)
@@ -529,16 +563,7 @@ async def test_sweep_mixed_active_and_inactive_users(sweep_env) -> None:
             return_value=httpx.Response(200, json=_token_response()),
         )
         rmock.post(_SUBS_URL).mock(
-            return_value=httpx.Response(
-                201,
-                json=_subscription_response(
-                    sub_id="sub-new",
-                    resource=(
-                        "users/oid-active/mailFolders('Inbox')/messages"
-                    ),
-                    expiration=expiry,
-                ),
-            ),
+            side_effect=_make_subscription_dispatcher(expiry),
         )
         rmock.delete(f"{_SUBS_URL}/sub-old").mock(
             return_value=httpx.Response(204),
@@ -553,9 +578,9 @@ async def test_sweep_mixed_active_and_inactive_users(sweep_env) -> None:
 
     assert result.users_seen == 1
     assert result.orphans_deleted == 1
-    assert result.actions == {"created": 1, "orphan_deleted": 1}
+    assert result.actions == {"created": 2, "orphan_deleted": 1}
 
-    # The active user's brand-new sub stays; the deactivated user's
+    # The active user's two fresh subs stay; the deactivated user's
     # row is gone.
     async with sm() as session, firm_context(firm_id):
         rows = (
@@ -564,6 +589,8 @@ async def test_sweep_mixed_active_and_inactive_users(sweep_env) -> None:
                 .where(GraphSubscription.firm_id == firm_id)
             )
         ).scalars().all()
-        assert len(rows) == 1
-        assert rows[0].subscription_id == "sub-new"
+        assert len(rows) == 2
+        resources = {r.resource for r in rows}
+        assert any("messages" in r for r in resources)
+        assert any("events" in r for r in resources)
     assert active_uid and inactive_uid  # silence linter

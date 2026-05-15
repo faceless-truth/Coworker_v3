@@ -50,6 +50,7 @@ from coworker.db import redis as redis_module
 from coworker.db.firms import lookup_firm_by_slug
 from coworker.db.models import GraphSubscription
 from coworker.db.session import firm_context, get_session
+from coworker.graph.subscription_bootstrap import RESOURCE_TRIGGER_MAP
 from coworker.security.encryption import decrypt_str
 from coworker.workers.plugin_queue import PluginEventQueue
 
@@ -157,11 +158,20 @@ async def graph_webhook(
                 lifecycle_handled += 1
                 continue
 
+            trigger = _trigger_for_resource(row.resource)
+            if trigger is None:
+                logger.warning(
+                    "graph webhook unsupported resource sub_id={} "
+                    "resource={!r}",
+                    sub_id, row.resource,
+                )
+                rejected += 1
+                continue
             event_data = _build_event_data(notif)
             if event_data is None:
                 continue
             await queue.enqueue(
-                trigger="email_received",
+                trigger=trigger,
                 firm_slug=firm_slug,
                 firm_id=firm.id,
                 event_data=event_data,
@@ -176,6 +186,21 @@ async def graph_webhook(
         )
 
     return Response(status_code=202)
+
+
+def _trigger_for_resource(resource: str) -> str | None:
+    """Map a subscription's resource path to the trigger we enqueue.
+
+    The Phase 12-6 design uses ``RESOURCE_TRIGGER_MAP`` (in
+    subscription_bootstrap) so adding a new resource type — say
+    /tasks — needs only one entry there and a sweep template.
+    Unknown resources return None and the receiver logs + drops
+    the notification.
+    """
+    for suffix, trigger in RESOURCE_TRIGGER_MAP.items():
+        if resource.endswith(suffix):
+            return trigger
+    return None
 
 
 async def _validated_subscription_row(
