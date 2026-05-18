@@ -226,6 +226,63 @@ if [[ "$DEPLOY_MODE" == "local" ]]; then
     done
   }
 
+  # Manual-rollback handler for the §3 unit-start sequence
+  # (§3d/§3e/§3f). Armed by the scoped ERR trap immediately below
+  # and disarmed before §4. Prints a paste-ready rollback command
+  # block to stderr and exits 1. Performs no mutation: no `ln`, no
+  # `systemctl`, no DB touch. The §4/§5/§6 verification gates use
+  # `rollback_to_prev` via explicit calls and are deliberately NOT
+  # covered by this trap (it is disarmed before §4 begins).
+  #
+  # Why manual at this gate: a start-sequence failure is almost
+  # always a config/env issue (missing variable, syntax error in a
+  # unit file, port conflict) an operator should inspect on the
+  # half-started fleet before reverting. Auto-papering over the
+  # failure would obscure the diagnosis. The printed block makes
+  # the manual revert zero-guesswork once inspection is done.
+  print_manual_rollback_and_exit() {
+    trap - ERR
+    echo "" >&2
+    echo "=== Deploy failed during §3 unit-start sequence ===" >&2
+    echo "" >&2
+    echo "The §3c symlink swap completed; /opt/coworker/current now" >&2
+    echo "points at $RELEASE_DIR. A systemd unit start in §3d/§3e/§3f" >&2
+    echo "returned non-zero, so the script stopped before the §4/§5/§6" >&2
+    echo "verification gates ran. No automatic rollback has been" >&2
+    echo "performed — start-sequence failures are typically config/env" >&2
+    echo "issues an operator should diagnose on the half-started fleet" >&2
+    echo "before reverting." >&2
+    echo "" >&2
+    echo "Inspect first:" >&2
+    echo "  systemctl list-units --failed --type=service,timer 'coworker-*'" >&2
+    echo "  journalctl -u <unit> --no-pager -n 50" >&2
+    echo "" >&2
+    echo "When ready to roll back, paste the block below as-is. All" >&2
+    echo "paths and unit names are fully resolved; no substitutions" >&2
+    echo "needed." >&2
+    echo "" >&2
+    echo "-----8<----- BEGIN MANUAL ROLLBACK -----8<-----" >&2
+    echo "sudo ln -sfn \"$PREV_RELEASE\" /opt/coworker/current" >&2
+    echo "sudo systemctl reload-or-restart coworker-api.service" >&2
+    for unit in coworker-worker.service "${TIMER_ACTIVATED_SERVICES[@]}" "${TIMERS[@]}"; do
+      echo "sudo systemctl stop $unit" >&2
+    done
+    echo "------8<----- END MANUAL ROLLBACK -----8<------" >&2
+    echo "" >&2
+    echo "Pre-deploy DB backup retained at: $BACKUP_FILE" >&2
+    echo "" >&2
+    echo "Sibling units' pre-deploy is-enabled state:" >&2
+    for unit in "${!PRE_DEPLOY_ENABLED[@]}"; do
+      echo "  $unit = ${PRE_DEPLOY_ENABLED[$unit]}" >&2
+    done
+    exit 1
+  }
+
+  # Arm scoped ERR trap covering ONLY the §3 unit-start sequence.
+  # Disarmed before §4 begins so it does not interfere with the
+  # rollback_to_prev calls at §4/§5/§6, which are explicit.
+  trap print_manual_rollback_and_exit ERR
+
   # ----- §3d enable + restart always-on services -----
   sudo systemctl enable coworker-api.service
   sudo systemctl reload-or-restart coworker-api.service
@@ -245,6 +302,10 @@ if [[ "$DEPLOY_MODE" == "local" ]]; then
   for unit in "${TIMERS[@]}"; do
     sudo systemctl enable --now "$unit"
   done
+
+  # Disarm the §3 ERR trap. §4/§5/§6 use rollback_to_prev via
+  # explicit calls, not via this trap.
+  trap - ERR
 
   # ----- §4 negative failure-scan -----
   # Catches units that started and crashed loudly. The valid form is

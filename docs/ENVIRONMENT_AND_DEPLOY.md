@@ -196,7 +196,11 @@ What it does, in order:
 11. **Restart services:** `coworker-api` (reload-or-restart),
     `coworker-worker` (restart), each timer-activated oneshot
     (enable + restart — one round of work fires immediately as a
-    sanity check), each timer (enable + start).
+    sanity check), each timer (enable + start). On any
+    `systemctl` non-zero in this step, the script does NOT
+    auto-roll-back; instead it prints a paste-ready manual
+    rollback command block (see *Rollback semantics* below) and
+    exits 1.
 12. **Negative failure-scan.** `systemctl list-units --failed
     --type=service,timer 'coworker-*'` — if any failed, dump 30
     lines of `journalctl -u <unit>` per failure and roll back.
@@ -217,8 +221,17 @@ What it does, in order:
 
 #### Rollback semantics
 
-On any failure between the symlink swap (step 10) and the end of
-verification (step 14), the script:
+There are **two** failure windows between the symlink swap (step
+10) and the end of verification (step 14), with different
+behaviour: the unit-start sequence (step 11), which **does NOT**
+auto-roll-back, and the verification gates (steps 12–14), which
+do.
+
+**Auto-rollback — verification failures (steps 12, 13, 14).**
+
+If the negative failure-scan (step 12), the positive `is-active`
+assertions (step 13), or the `/health` smoke test (step 14)
+fails, the script:
 
 1. Re-points `/opt/coworker/current` at `PREV_RELEASE`.
 2. `reload-or-restart coworker-api.service` so production traffic
@@ -230,14 +243,46 @@ verification (step 14), the script:
    `is-enabled` state (captured at the start of the deploy).
 5. Exits 1.
 
+**Manual rollback — unit-start failures (step 11).**
+
+If a `systemctl enable` / `restart` / `reload-or-restart` /
+`enable --now` during the step-11 unit-start sequence
+(§3d/§3e/§3f in the script) returns non-zero, the script does
+**not** auto-roll-back. Under `set -euo pipefail` the failure
+would otherwise exit before any verification gate ran; instead a
+scoped `ERR` trap — armed immediately after the symlink swap and
+disarmed before step 12 — intercepts the failure and prints a
+clearly delimited, paste-ready manual rollback command block to
+stderr, then exits 1.
+
+The printed block contains the same `ln -sfn`,
+`reload-or-restart`, and sibling-`stop` set the auto-rollback
+would have issued, with `$PREV_RELEASE` already resolved to an
+absolute path and every unit name spelled out — no substitutions
+or guesswork. It also prints the pre-deploy `pg_dump` path and
+each unit's pre-deploy `is-enabled` state, matching what the
+auto-rollback path logs. Nothing is mutated: no `ln`, no
+`systemctl`, no DB touch.
+
+Why this gate is manual rather than auto: a start-sequence
+failure is almost always a config/env issue (missing variable,
+unit-file syntax error, port conflict) that an operator should
+diagnose on the half-started fleet before reverting. The
+PUBLIC_WEBHOOK_BASE_URL miss on the 09fad28 deploy is the
+canonical example. Auto-papering over the failure would obscure
+the diagnosis; printing the exact revert commands makes the
+manual revert zero-guesswork once inspection is done.
+
 Sibling units (`coworker-worker`, the 5 timer-activated oneshots,
 and the 5 timers) are **stopped** by the rollback (`systemctl
-stop`), but **not** disabled. Their pre-deploy `is-enabled` state
-is captured at the start of the deploy and printed for the
-operator. Stopping them ensures they don't keep running against
-the rolled-back symlink (inspectable-and-inert); leaving them
-enabled means `systemctl status <unit>` and `journalctl -u <unit>`
-work without further setup.
+stop`), but **not** disabled — the same set both the
+auto-rollback path and the printed manual block target. Their
+pre-deploy `is-enabled` state is captured at the start of the
+deploy and printed for the operator. Stopping them ensures they
+don't keep running against the rolled-back symlink
+(inspectable-and-inert); leaving them enabled means `systemctl
+status <unit>` and `journalctl -u <unit>` work without further
+setup.
 
 ### 2.2 PUSH path — workstation rsync (legacy)
 
