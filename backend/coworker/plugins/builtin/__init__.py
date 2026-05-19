@@ -40,6 +40,9 @@ from coworker.plugins.base import PluginRegistry
 from coworker.plugins.builtin.delivery_status_handler import (
     DeliveryStatusHandlerPlugin,
 )
+from coworker.plugins.builtin.individual_return_prep import (
+    IndividualReturnPrepPlugin,
+)
 from coworker.plugins.builtin.meeting_prep import MeetingPrepPlugin
 from coworker.plugins.builtin.smart_responder import SmartResponderPlugin
 
@@ -49,10 +52,12 @@ def register_builtin_plugins(registry: PluginRegistry) -> None:
     registry.register(SmartResponderPlugin)
     registry.register(MeetingPrepPlugin)
     registry.register(DeliveryStatusHandlerPlugin)
+    registry.register(IndividualReturnPrepPlugin)
 
 
 __all__ = [
     "DeliveryStatusHandlerPlugin",
+    "IndividualReturnPrepPlugin",
     "MeetingPrepPlugin",
     "SmartResponderPlugin",
     "register_builtin_plugins",
