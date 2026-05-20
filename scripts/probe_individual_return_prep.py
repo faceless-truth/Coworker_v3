@@ -187,54 +187,82 @@ def _render_docx(findings: dict, output_path: Path) -> None:
         "have been entered into a return by this process."
     )
 
-    sections = [
-        (
-            "Deductibles found",
-            "deductibles_found",
-            "Deduction categories supported by the current-year documents, "
-            "per the methodology's occupation/category review.",
-        ),
-        (
-            "Missing vs last year",
-            "missing_vs_last_year",
-            "Every prior-year income/deduction category that is absent "
-            "from the current-year documents. Per the Gap 1 presence/"
-            "absence rule — NOT a magnitude threshold.",
-        ),
-        (
-            "Client follow-up questions",
-            "client_follow_up_questions",
-            "Drawn from the missing-vs-last-year items and the "
-            "methodology's §15 review-question framework.",
-        ),
-    ]
-    for heading, key, blurb in sections:
-        doc.add_heading(heading, level=1)
-        blurb_p = doc.add_paragraph()
-        blurb_run = blurb_p.add_run(blurb)
-        blurb_run.italic = True
-        items = findings.get(key, [])
-        if not items:
-            doc.add_paragraph("(no items found in this section)")
-            continue
-        for i, item in enumerate(items, start=1):
+    # Section 1: deductibles found.
+    # R2 (PAUSE-3 refinement): per-item trace tags (prior_year_present /
+    # current_year_present) are NOT rendered — those are engine traces,
+    # not accountant content. They remain in the JSON the model emits,
+    # but the docx is the accountant-facing surface and omits them.
+    doc.add_heading("Deductibles found", level=1)
+    blurb_p = doc.add_paragraph()
+    blurb_run = blurb_p.add_run(
+        "Deduction categories supported by the current-year documents, "
+        "per the methodology's occupation/category review."
+    )
+    blurb_run.italic = True
+    deductibles = findings.get("deductibles_found", [])
+    if not deductibles:
+        doc.add_paragraph("(no items found in this section)")
+    else:
+        for i, item in enumerate(deductibles, start=1):
             doc.add_heading(
                 f"{i}. {item.get('category') or '<no category>'}",
                 level=2,
             )
-            obs = item.get("observation") or "(no observation provided)"
-            doc.add_paragraph(obs)
+            doc.add_paragraph(
+                item.get("observation") or "(no observation provided)"
+            )
+
+    # Section 2: consolidated client follow-up questions.
+    # R3 (PAUSE-3 refinement): the prior top-level "Missing vs last year"
+    # section is collapsed into this one. JSON missing_vs_last_year items
+    # render here with a "Last year: <observation>" provenance line so the
+    # question and its prior-year context arrive together, instead of as
+    # a duplicate item across two sections. The JSON schema retains both
+    # arrays (model output unchanged); only the docx consolidates.
+    doc.add_heading("Client follow-up questions", level=1)
+    blurb_p = doc.add_paragraph()
+    blurb_run = blurb_p.add_run(
+        "Combined from prior-year categories absent from the current-year "
+        "documents (each carrying 'Last year:' provenance) and the "
+        "methodology's §15 review-question framework."
+    )
+    blurb_run.italic = True
+    missing = findings.get("missing_vs_last_year", [])
+    questions = findings.get("client_follow_up_questions", [])
+    if not missing and not questions:
+        doc.add_paragraph("(no items found in this section)")
+    else:
+        idx = 1
+        for item in missing:
+            doc.add_heading(
+                f"{idx}. {item.get('category') or '<no category>'}",
+                level=2,
+            )
+            idx += 1
+            obs = item.get("observation")
+            if obs:
+                p = doc.add_paragraph()
+                p.add_run("Last year: ").bold = True
+                p.add_run(obs)
             q = item.get("client_question")
             if q:
                 p = doc.add_paragraph()
                 p.add_run("Client question: ").bold = True
                 p.add_run(q)
-            details = doc.add_paragraph()
-            details_run = details.add_run(
-                f"prior_year_present={item.get('prior_year_present')!r}, "
-                f"current_year_present={item.get('current_year_present')!r}"
+        for item in questions:
+            doc.add_heading(
+                f"{idx}. {item.get('category') or '<no category>'}",
+                level=2,
             )
-            details_run.italic = True
+            idx += 1
+            obs = item.get("observation")
+            if obs:
+                doc.add_paragraph(obs)
+            q = item.get("client_question")
+            if q:
+                p = doc.add_paragraph()
+                p.add_run("Client question: ").bold = True
+                p.add_run(q)
 
     doc.add_heading("Limitations of this draft", level=1)
     doc.add_paragraph(

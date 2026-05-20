@@ -12,6 +12,13 @@ verbatim from ``docs/methodology/individual_tax_return.md`` at module import.
 Thin sections (notably §4 occupation-specific) ship thin per the methodology
 as-written; the plugin does NOT add tax knowledge beyond the methodology.
 
+The year-over-year comparison scoping rule (§3 "Scope of year-over-year
+comparison" — ATO-prefilled income out, interest and dividends in) is loaded
+with the rest of §3 via ``_METHODOLOGY_TEXT``. There is no plugin-side
+encoding of this rule and none should be added: duplicating methodology in
+code creates drift the next time the methodology changes. The methodology
+document is the single source of truth for the scope of the comparison.
+
 Gap 1 override (load-bearing)
 -----------------------------
 Methodology §3 references "material" variances. For this engine that language
@@ -143,7 +150,10 @@ Rules:
 
 - ``missing_vs_last_year`` items MUST have prior_year_present=true,
   current_year_present=false, and a non-null client_question. This is the
-  Gap 1 presence/absence rule encoded.
+  Gap 1 presence/absence rule encoded. Scope of which categories are
+  eligible for ``missing_vs_last_year`` is governed by the methodology's
+  §3 "Scope of year-over-year comparison" subsection — do not include
+  categories §3 places out of scope.
 - ``client_follow_up_questions`` may include items not tied to a specific
   missing category — for example questions from methodology §15 that probe
   areas the current-year documents are silent on (marital status, super
@@ -235,9 +245,11 @@ class IndividualReturnPrepPlugin(OrchestratorPlugin):
             "- deductibles_found: deduction categories supported by the "
             "current-year documents, per the methodology's "
             "occupation/category review.\n"
-            "- missing_vs_last_year: every prior-year income/deduction "
-            "category absent from the current-year documents. "
-            "Presence/absence rule — no magnitude threshold.\n"
+            "- missing_vs_last_year: every prior-year category in scope "
+            "per the methodology's §3 \"Scope of year-over-year "
+            "comparison\" subsection that is absent from the current-"
+            "year documents. Presence/absence rule — no magnitude "
+            "threshold.\n"
             "- client_follow_up_questions: from missing items plus the "
             "methodology's §15 review-question framework. Include "
             "questions for areas the current-year documents are silent "
