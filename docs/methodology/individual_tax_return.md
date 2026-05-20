@@ -72,13 +72,8 @@ Always compare the current-year return against the previous lodged return.
 
 Review for:
 
-* Missing employers.
-* Additional income streams.
 * Investment income changes.
-* Reduced or increased wages.
 * Foreign income.
-* Director fees.
-* Government payments.
 * PSI indicators.
 * Business cessation or commencement.
 
@@ -120,6 +115,30 @@ Examples:
 | Repairs significantly increase | Determine capital vs repair             |
 | No rental interest claimed     | Verify loan refinance or offset usage   |
 | Large drop in income           | Confirm employment change               |
+
+## Scope of year-over-year comparison
+
+This subsection scopes the comparison procedures specified above.
+
+The presence/absence variance test applies to deduction categories
+and non-prefilled income categories. ATO-prefilled income — salary/
+wages and employer details, allowances/tips/directors fees,
+government payments (Centrelink and similar) — is **out of scope**
+for year-over-year comparison. The ATO is the source of truth for
+these items; year-over-year questioning of the client on prefilled
+data is a waste of the client's time and the firm's.
+
+Two exceptions apply, where ATO prefill is known to be unreliable:
+
+* **Interest income** — banks occasionally fail to prefill bank
+  interest correctly.
+* **Dividends** — same reason; verification against client records
+  is required.
+
+Interest and dividend categories are compared year-over-year per
+§3. Any change in presence between years (present last year, absent
+this year, or the reverse) generates a client follow-up question
+per §15.
 
 ---
 
