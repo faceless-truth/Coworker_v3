@@ -51,32 +51,32 @@ Response 200:
 
 ## Approvals
 
-### `GET /api/v1/approvals`
+### `GET /api/v1/approvals/pending`
 
 Auth required.
 
 Query params:
-- `status` (string, default `pending`): `pending` | `approved` | `rejected` | `sent` | `dispatch_failed`
-- `limit` (int, default 50)
-- `offset` (int, default 0)
+- `limit` (int, default 50, max 200)
 
-Response 200: `{ total: N, items: [...] }` where each item matches the `approval_items` table schema with confidence, payload, etc. (Full field list to be locked in once the frontend team consumes this; for now the existing `/approval/pending` shape is the reference — see source for canonical shape until this section is fleshed out.)
+Response 200: bare JSON array of approval-item objects (newest first, RLS-scoped to the authenticated firm). Each object mirrors the `approval_items` row with: `id`, `trace_id`, `plugin_name`, `category`, `summary`, `payload`, `status`, `decided_at`, `decided_by_user_id`, `decision_notes`, `last_edited_at`, `last_edited_by_user_id`, `required_approvals`, `approval_signatures`, `confidence`, `created_at`, `updated_at`.
 
-### `GET /api/v1/approvals/{id}`
+Future tasks will broaden this to `GET /api/v1/approvals?status=<status>&limit=&offset=` returning `{ total, items }`. Until then, only pending items are listable.
 
-Auth required. Returns a single approval item.
+### `GET /api/v1/approvals/{item_id}`
 
-### `POST /api/v1/approvals/{id}/approve`
+Auth required. Returns a single approval item. 404 on unknown id or cross-firm read (RLS hides cross-firm rows).
 
-Auth required. Approves the item. Body: `{ "edited_draft": "optional" }`. If `edited_draft` omitted, the original payload is used.
+### `POST /api/v1/approvals/{item_id}/approve`
 
-### `POST /api/v1/approvals/{id}/reject`
+Auth required. Transitions pending to approved. Optional body: `{ "notes": "string, max 2000" }`. Returns the post-transition row. 409 on non-pending state.
 
-Auth required. Rejects the item. Body: `{ "reason": "optional" }`.
+### `POST /api/v1/approvals/{item_id}/reject`
 
-### `PUT /api/v1/approvals/{id}/payload`
+Auth required. Transitions pending to rejected. Same body shape and error behaviour as approve.
 
-Auth required. Edits the draft payload before approval (Phase 9.3 edit metadata).
+### `PUT /api/v1/approvals/{item_id}/payload`
+
+Auth required. Replaces a pending item's payload (wholesale, not patch). Body: `{ "payload": { ... } }`. Item stays pending; only approve / reject move to a terminal state. 409 on non-pending state. Phase 9.3 edit metadata is recorded.
 
 ## Mail
 
