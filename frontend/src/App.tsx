@@ -1,61 +1,70 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { AuthProvider, useAuth } from './auth/AuthContext'
+import Sidebar from './components/Sidebar'
+import Header from './components/Header'
+import Login from './pages/Login'
+import Dashboard from './pages/Dashboard'
+import Approvals from './pages/Approvals'
+import Plugins from './pages/Plugins'
+import Memory from './pages/Memory'
+import KnowledgeGraph from './pages/KnowledgeGraph'
+import Activity from './pages/Activity'
+import Findings from './pages/Findings'
+import Chat from './pages/Chat'
+import Specialists from './pages/Specialists'
+import Settings from './pages/Settings'
 
-import { CurrentUserProvider } from "@/auth/CurrentUserProvider";
-import { RequireAuth } from "@/auth/RequireAuth";
-import { ApprovalDetailPage } from "@/pages/ApprovalDetailPage";
-import { ApprovalQueuePage } from "@/pages/ApprovalQueuePage";
-import { HealthPage } from "@/pages/HealthPage";
-import { SignInPage } from "@/pages/SignInPage";
+function AppShell() {
+  const { user, loading, logout } = useAuth()
 
-/**
- * Top-level router.
- *
- * - ``/signin`` is the only un-authed route; everything else
- *   sits behind ``RequireAuth``.
- * - ``/`` redirects to ``/approval`` — the principal's daily
- *   landing.
- * - ``/health`` is kept for ops/debug sanity (Phase 10-1).
- * - ``/approval`` lists pending items (Phase 10-3);
- *   ``/approval/:id`` is the per-item review surface (Phase 10-4).
- */
-export function App() {
-  return (
-    <CurrentUserProvider>
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: '#f3f1ee' }}>
+        <div className="text-sm" style={{ color: '#858481' }}>Loading…</div>
+      </div>
+    )
+  }
+
+  if (!user) {
+    return (
       <Routes>
-        <Route path="/signin" element={<SignInPage />} />
-        <Route
-          path="/"
-          element={<Navigate to="/approval" replace />}
-        />
-        <Route
-          path="/approval"
-          element={
-            <RequireAuth>
-              <ApprovalQueuePage />
-            </RequireAuth>
-          }
-        />
-        <Route
-          path="/approval/:id"
-          element={
-            <RequireAuth>
-              <ApprovalDetailPage />
-            </RequireAuth>
-          }
-        />
-        <Route
-          path="/health"
-          element={
-            <RequireAuth>
-              <HealthPage />
-            </RequireAuth>
-          }
-        />
-        <Route
-          path="*"
-          element={<Navigate to="/approval" replace />}
-        />
+        <Route path="*" element={<Login />} />
       </Routes>
-    </CurrentUserProvider>
-  );
+    )
+  }
+
+  return (
+    <div className="flex h-screen overflow-hidden" style={{ background: '#f3f1ee' }}>
+      <Sidebar />
+      <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+        <Header user={user} onLogout={logout} />
+        <main className="flex-1 overflow-auto">
+          <Routes>
+            <Route path="/" element={<Navigate to="/dashboard" replace />} />
+            <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/approvals" element={<Approvals />} />
+            <Route path="/plugins" element={<Plugins />} />
+            <Route path="/memory" element={<Memory />} />
+            <Route path="/knowledge-graph" element={<KnowledgeGraph />} />
+            <Route path="/activity" element={<Activity />} />
+            <Route path="/findings" element={<Findings />} />
+            <Route path="/chat" element={<Chat />} />
+            <Route path="/specialists" element={<Specialists />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="*" element={<Navigate to="/dashboard" replace />} />
+          </Routes>
+        </main>
+      </div>
+    </div>
+  )
+}
+
+export default function App() {
+  return (
+    <BrowserRouter>
+      <AuthProvider>
+        <AppShell />
+      </AuthProvider>
+    </BrowserRouter>
+  )
 }

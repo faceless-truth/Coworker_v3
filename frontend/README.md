@@ -1,30 +1,73 @@
-# CoWorker Frontend
+# React + TypeScript + Vite
 
-React 19 + Vite + TypeScript + TanStack Query + Tailwind 4.
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-## Phase 10-1: scaffold
+Currently, two official plugins are available:
 
-This directory was empty until Phase 10-1. It now contains a
-minimal `/health` page that verifies the Vite dev-server proxies
-correctly to the FastAPI backend on port 8001.
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-```bash
-# From this directory
-npm install       # or: pnpm install / bun install
-npm run dev       # serves on http://localhost:5173
+## React Compiler
+
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+
+```js
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+
+      // Remove tseslint.configs.recommended and replace with this
+      tseslint.configs.recommendedTypeChecked,
+      // Alternatively, use this for stricter rules
+      tseslint.configs.strictTypeChecked,
+      // Optionally, add this for stylistic rules
+      tseslint.configs.stylisticTypeChecked,
+
+      // Other configs...
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
 ```
 
-While the dev server runs, requests to `/health`, `/auth`,
-`/approval`, `/mail`, and `/webhooks` are proxied to the
-backend (default `http://127.0.0.1:8001`; override with
-`VITE_API_TARGET`). The session cookie flows through the proxy
-unchanged so an authenticated session in the backend works in
-the frontend.
+You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
 
-## Next sub-phases
+```js
+// eslint.config.js
+import reactX from 'eslint-plugin-react-x'
+import reactDom from 'eslint-plugin-react-dom'
 
-- 10-2: OAuth login wrapper (`/auth/microsoft/start` + callback)
-  and an unauthenticated landing redirect.
-- 10-3: approval queue list page (`GET /approval/pending`).
-- 10-4: approval item detail with edit (PUT) and approve/reject
-  (POST) buttons.
+export default defineConfig([
+  globalIgnores(['dist']),
+  {
+    files: ['**/*.{ts,tsx}'],
+    extends: [
+      // Other configs...
+      // Enable lint rules for React
+      reactX.configs['recommended-typescript'],
+      // Enable lint rules for React DOM
+      reactDom.configs.recommended,
+    ],
+    languageOptions: {
+      parserOptions: {
+        project: ['./tsconfig.node.json', './tsconfig.app.json'],
+        tsconfigRootDir: import.meta.dirname,
+      },
+      // other options...
+    },
+  },
+])
+```
