@@ -63,6 +63,17 @@ SYSTEMCTL="${DEPLOY_SYSTEMCTL:-systemctl}"
 # preserves enforcement byte-for-byte.
 DEPLOY_SKIP_GIT_CHECK="${DEPLOY_SKIP_GIT_CHECK:-0}"
 
+# Opt-in: build and ship the frontend bundle. Defaults OFF so a
+# backend-only deploy does not pay a 60-90s pnpm install + vite build.
+# Set DEPLOY_BUILD_FRONTEND=1 when the frontend has changed (or when
+# you want a from-source rebuild on top of an unchanged source, e.g.
+# rotating a transitive dep). The frontend ship is independent of the
+# backend release symlink; it rsyncs into a shared static directory
+# that Caddy serves directly.
+DEPLOY_BUILD_FRONTEND="${DEPLOY_BUILD_FRONTEND:-0}"
+DEPLOY_FRONTEND_BUNDLE_DIR="${DEPLOY_FRONTEND_BUNDLE_DIR:-/opt/coworker/shared/frontend}"
+DEPLOY_FRONTEND_OWNER="${DEPLOY_FRONTEND_OWNER:-caddy:caddy}"
+
 DOMAIN="$DEPLOY_DOMAIN"
 RELEASE_DIR="$DEPLOY_RELEASES_DIR/$RELEASE"
 
@@ -138,6 +149,30 @@ if [[ "$DEPLOY_MODE" == "local" ]]; then
   # ----- §1 build release via `git archive` (no .git, matches a81083a shape) -----
   $SUDO -u coworker mkdir -p "$RELEASE_DIR"
   git archive --format=tar "$RESOLVED_SHA" | $SUDO -u coworker tar -x -C "$RELEASE_DIR"
+
+  # ----- §1.5 frontend build (gated, before any backend mutation) -----
+  # Runs ONLY when DEPLOY_BUILD_FRONTEND=1. Build happens against
+  # $RELEASE_DIR/frontend (the just-extracted release source, not the
+  # working tree), so the bundle is reproducible from the same SHA the
+  # backend was deployed from. Failure here aborts BEFORE §2b's
+  # pg_dump and §2c's alembic upgrade — no DB or symlink state has
+  # changed yet, the live bundle is untouched, the operator can re-run.
+  # The actual rsync into the live shared dir happens at §6.5, after
+  # backend health is green.
+  if [[ "$DEPLOY_BUILD_FRONTEND" == "1" ]]; then
+    if [[ ! -d "$RELEASE_DIR/frontend" ]]; then
+      echo "Error: DEPLOY_BUILD_FRONTEND=1 but $RELEASE_DIR/frontend missing in release."
+      exit 1
+    fi
+    echo ""
+    echo "Building frontend in $RELEASE_DIR/frontend ..."
+    $SUDO -u coworker bash -c "cd '$RELEASE_DIR/frontend' && pnpm install --frozen-lockfile && pnpm run build"
+    if [[ ! -f "$RELEASE_DIR/frontend/dist/index.html" ]]; then
+      echo "Error: frontend build did not produce dist/index.html."
+      exit 1
+    fi
+    echo "Frontend build complete."
+  fi
 
   # ----- §2a build venv at release ROOT -----
   # pyproject.toml + uv.lock live at the repo root, not under backend/.
@@ -435,6 +470,33 @@ if [[ "$DEPLOY_MODE" == "local" ]]; then
     echo "Health response missing 'version' key."
     rollback_to_prev
     exit 1
+  fi
+
+  # ----- §6.5 frontend ship (gated, after backend is verified healthy) -----
+  # Runs ONLY when DEPLOY_BUILD_FRONTEND=1 (the build at §1.5 produced
+  # $RELEASE_DIR/frontend/dist/). Backend health has passed at §6, so
+  # by the time this fires we know the new release is serving requests.
+  # Steps:
+  #   a. Snapshot the current live bundle to a timestamped backup dir
+  #      next to it. One-command rollback target.
+  #   b. rsync --delete the new dist/ into the live bundle dir. Caddy
+  #      serves the static files directly; no service restart needed.
+  #   c. chown the new files to match the existing bundle's owner so
+  #      Caddy's worker keeps read access without an explicit reload.
+  # No automatic rollback hook here — the frontend ship is the last
+  # mutation and Caddy picks up the new files on the next request, so
+  # if anything looks wrong the operator runs the rsync in reverse
+  # from the backup dir captured below (see docs/runbooks).
+  if [[ "$DEPLOY_BUILD_FRONTEND" == "1" ]]; then
+    FRONTEND_BACKUP_DIR="${DEPLOY_FRONTEND_BUNDLE_DIR}.backup-$(date +%Y%m%d-%H%M%S)"
+    echo ""
+    echo "Backing up live frontend bundle to $FRONTEND_BACKUP_DIR ..."
+    $SUDO cp -a "$DEPLOY_FRONTEND_BUNDLE_DIR" "$FRONTEND_BACKUP_DIR"
+
+    echo "Shipping new frontend bundle to $DEPLOY_FRONTEND_BUNDLE_DIR ..."
+    $SUDO rsync -a --delete "$RELEASE_DIR/frontend/dist/" "$DEPLOY_FRONTEND_BUNDLE_DIR/"
+    $SUDO chown -R "$DEPLOY_FRONTEND_OWNER" "$DEPLOY_FRONTEND_BUNDLE_DIR"
+    echo "Frontend shipped. Rollback target: $FRONTEND_BACKUP_DIR"
   fi
 
   # ----- §7 final state -----
