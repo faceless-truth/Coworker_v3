@@ -25,6 +25,32 @@ DRIVERS_LICENCE_VIC = PatternRecognizer(
 )
 
 
+# Entity types replaced with placeholders before any payload reaches
+# Anthropic. Australian identifiers first, then the generic presidio
+# defaults that are relevant to an accounting practice.
+#
+# DATE_TIME is deliberately excluded. spaCy's DATE_TIME recogniser
+# false-positives on statute references ("SIS Act 1993", "ITAA 1936"),
+# legislative amendment years ("as amended in 2014"), and heading-style
+# section pinpoints ("s 62 SIS Act: ..."), which leaves user-visible
+# residue like "SIS Act s [DATE_TIME_xxx]" when scrub-restore round
+# trips through the chat streaming path. Calendar dates are not
+# sensitive identifiers for an accounting practice; the load-bearing
+# ones (TFN, ABN, Medicare, names, emails, phone numbers, card numbers)
+# are still scrubbed.
+SCRUBBED_ENTITY_TYPES = [
+    "AU_TFN",
+    "AU_ABN",
+    "AU_MEDICARE",
+    "AU_DL_VIC",
+    "PHONE_NUMBER",
+    "EMAIL_ADDRESS",
+    "CREDIT_CARD",
+    "IBAN_CODE",
+    "PERSON",
+]
+
+
 @dataclass
 class ScrubResult:
     text: str
@@ -50,11 +76,7 @@ class PIIScrubber:
             self.analyzer.registry.add_recognizer(r)
 
     def scrub(self, text: str, *, entities: list[str] | None = None) -> ScrubResult:
-        entities = entities or [
-            "AU_TFN", "AU_ABN", "AU_MEDICARE", "AU_DL_VIC",
-            "PHONE_NUMBER", "EMAIL_ADDRESS", "CREDIT_CARD",
-            "IBAN_CODE", "DATE_TIME", "PERSON",
-        ]
+        entities = entities or SCRUBBED_ENTITY_TYPES
         results = self.analyzer.analyze(text=text, language="en", entities=entities)
         # Recognisers can produce overlapping hits — Presidio's
         # generic PHONE_NUMBER often co-fires with our AU_ABN /
