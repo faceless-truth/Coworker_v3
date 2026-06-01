@@ -37,6 +37,14 @@ _LOGIN_URL_RE = re.compile(
     r"^https://login\.microsoftonline\.com/[^/]+/oauth2/v2\.0/token$"
 )
 
+# Valid v4 UUID used as the test user's azure_object_id and embedded in
+# the notification resource. _resolve_graph_ctx_for_email now parses
+# segment 1 as a real UUID, so the placeholder must round-trip through
+# uuid.UUID. Sequential _cleanup_firm in the fixture's finally block
+# keeps the globally-unique users.azure_object_id constraint satisfied
+# across tests.
+_TEST_AZURE_OID = "11111111-1111-4111-8111-111111111111"
+
 
 @pytest_asyncio.fixture
 async def refresh_env(test_database_url) -> AsyncIterator[dict]:
@@ -90,7 +98,7 @@ async def _seed(
     sm,
     *,
     expires_at: _dt.datetime | None,
-    azure_oid: str = "oid-1",
+    azure_oid: str = _TEST_AZURE_OID,
 ) -> tuple[uuid.UUID, uuid.UUID]:
     firm_id = uuid.uuid4()
     firm_id_str = str(firm_id)
@@ -123,7 +131,7 @@ async def _seed(
         return firm_id, user.id
 
 
-def _event_for(azure_oid: str = "oid-1") -> PluginEvent:
+def _event_for(azure_oid: str = _TEST_AZURE_OID) -> PluginEvent:
     return PluginEvent(
         event_id=uuid.uuid4(),
         trigger="email_received",
