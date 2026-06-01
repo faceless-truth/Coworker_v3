@@ -6,7 +6,8 @@ The Phase 10 web frontend calls these routes. Every route requires
 firm.
 
 Routes (all under /api/v1/approvals):
-    GET  /api/v1/approvals/pending           list the firm's pending items
+    GET  /api/v1/approvals                   list firm items, wrapped {total, items}
+    GET  /api/v1/approvals/pending           list the firm's pending items (legacy)
     GET  /api/v1/approvals/{item_id}         fetch one item
     POST /api/v1/approvals/{item_id}/approve pending -> approved
     POST /api/v1/approvals/{item_id}/reject  pending -> rejected
@@ -19,9 +20,9 @@ ids and cross-firm reads (RLS hides them).
 """
 import datetime as _dt
 import uuid
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,8 +30,10 @@ from coworker.api.deps import current_user
 from coworker.approval.items import (
     ApprovalTransitionError,
     approve,
+    count_for_firm,
     edit_payload,
     get_by_id,
+    list_for_firm,
     list_pending,
     reject,
 )
@@ -38,6 +41,13 @@ from coworker.db.models import ApprovalItem, User
 from coworker.db.session import firm_context, get_session
 
 router = APIRouter(prefix="/api/v1/approvals", tags=["approval"])
+
+# Mirrors the CHECK constraint on approval_items.status. The
+# frontend tab UI only sends the first three; the route accepts
+# all five so ops / diagnostic calls can list any state.
+ApprovalStatusLiteral = Literal[
+    "pending", "approved", "rejected", "sent", "dispatch_failed"
+]
 
 # How many pending items the list endpoint returns per call. The
 # table's partial index orders by (firm_id, created_at DESC) so
@@ -92,6 +102,17 @@ class ApprovalItemResponse(BaseModel):
         )
 
 
+class ApprovalListResponse(BaseModel):
+    """Wrapped list envelope the frontend Approvals page expects.
+
+    ``total`` is the full count of firm rows matching the filter,
+    independent of ``limit``; ``items`` is the (limit-capped) slice.
+    """
+
+    total: int
+    items: list[ApprovalItemResponse]
+
+
 class DecisionBody(BaseModel):
     """Optional principal note attached to an approve / reject."""
 
@@ -111,6 +132,30 @@ class EditPayloadBody(BaseModel):
 
     payload: dict[str, Any] = Field(
         description="Replacement payload. Shape depends on category.",
+    )
+
+
+@router.get("", response_model=ApprovalListResponse)
+async def list_route(
+    status: ApprovalStatusLiteral | None = None,
+    limit: int = Query(_DEFAULT_LIMIT, ge=1, le=_MAX_LIMIT),
+    user: User = Depends(current_user),
+    session: AsyncSession = Depends(get_session),
+) -> ApprovalListResponse:
+    """Return a firm's items, newest first, wrapped as {total, items}.
+
+    ``status`` filters to one state when supplied; otherwise every
+    state is returned. ``total`` reflects the full matching count
+    for the firm, not the post-``limit`` slice.
+    """
+    async with firm_context(user.firm_id):
+        total = await count_for_firm(session, user.firm_id, status=status)
+        rows = await list_for_firm(
+            session, user.firm_id, status=status, limit=limit,
+        )
+    return ApprovalListResponse(
+        total=total,
+        items=[ApprovalItemResponse.from_row(r) for r in rows],
     )
 
 
