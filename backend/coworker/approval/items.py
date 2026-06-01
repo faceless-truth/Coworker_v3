@@ -31,7 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from coworker.config import get_settings
@@ -174,6 +174,48 @@ async def list_pending(
         .limit(limit)
     )
     return list(result.scalars().all())
+
+
+async def list_for_firm(
+    session: AsyncSession,
+    firm_id: uuid.UUID,
+    *,
+    status: str | None = None,
+    limit: int = 50,
+) -> Sequence[ApprovalItem]:
+    """Most-recent-first list of a firm's approval items.
+
+    ``status=None`` means no status filter (returns every state).
+    Ordering matches ``list_pending``: ``created_at DESC``.
+    """
+    query = (
+        select(ApprovalItem)
+        .where(ApprovalItem.firm_id == firm_id)
+        .order_by(ApprovalItem.created_at.desc())
+        .limit(limit)
+    )
+    if status is not None:
+        query = query.where(ApprovalItem.status == status)
+    result = await session.execute(query)
+    return list(result.scalars().all())
+
+
+async def count_for_firm(
+    session: AsyncSession,
+    firm_id: uuid.UUID,
+    *,
+    status: str | None = None,
+) -> int:
+    """Count of a firm's approval items, optionally filtered by status."""
+    query = (
+        select(func.count())
+        .select_from(ApprovalItem)
+        .where(ApprovalItem.firm_id == firm_id)
+    )
+    if status is not None:
+        query = query.where(ApprovalItem.status == status)
+    result = await session.execute(query)
+    return int(result.scalar_one())
 
 
 async def get_by_id(
