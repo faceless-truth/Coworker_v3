@@ -274,6 +274,30 @@ async def _run_one_plugin(
         result.run_results.append(run_result)
 
 
+def _extract_azure_oid_from_resource(resource: str | None) -> str | None:
+    """Return the canonical-lowercase azure_object_id from a Graph resource path.
+
+    Microsoft delivers change-notification resources in mixed casing:
+    ``Users/{oid}/Messages/{id}`` (PascalCase, rewritten message
+    notifications), ``users/{oid}/mailFolders('Inbox')/messages`` (the
+    subscribed mail resource), and ``users/{oid}/events`` (the reused
+    calendar subscription). In every observed shape the oid is segment
+    index 1. We case-fold only the first segment, parse segment 1 as a
+    UUID, and return ``str(uuid.UUID(...))`` so the downstream lookup is
+    case-robust. Returns ``None`` on any structural or UUID-parse
+    failure. Side-effect free; the caller logs.
+    """
+    if not isinstance(resource, str):
+        return None
+    parts = resource.split("/")
+    if len(parts) < 2 or parts[0].lower() != "users":
+        return None
+    try:
+        return str(uuid.UUID(parts[1]))
+    except ValueError:
+        return None
+
+
 async def _resolve_graph_ctx_for_email(
     session: AsyncSession,
     *,
@@ -290,12 +314,15 @@ async def _resolve_graph_ctx_for_email(
     continues so the trace still records what was attempted.
     """
     resource = event.event_data.get("resource")
-    if not isinstance(resource, str) or not resource.startswith("users/"):
+    azure_oid = _extract_azure_oid_from_resource(resource)
+    if azure_oid is None:
+        logger.warning(
+            "worker graph ctx no oid firm_id={} event_id={} resource={!r}",
+            firm.id,
+            event.event_id,
+            resource,
+        )
         return None
-    parts = resource.split("/", 4)
-    if len(parts) < 2:
-        return None
-    azure_oid = parts[1]
 
     user = (
         await session.execute(
@@ -306,9 +333,10 @@ async def _resolve_graph_ctx_for_email(
     ).scalar_one_or_none()
     if user is None:
         logger.warning(
-            "worker user not found firm_id={} azure_oid={}",
+            "worker user not found firm_id={} azure_oid={} resource={!r}",
             firm.id,
             azure_oid,
+            resource,
         )
         return None
 
