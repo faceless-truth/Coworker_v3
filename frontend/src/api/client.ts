@@ -181,6 +181,51 @@ export const specialists = {
   },
 };
 
+// ─── Conversations (Chat) ────────────────────────────────────────────────────
+
+export interface ConversationSummary {
+  id: string;
+  title: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ConversationListResponse {
+  conversations: ConversationSummary[];
+}
+
+export interface ChatMessageOut {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  model: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface MessageHistoryResponse {
+  messages: ChatMessageOut[];
+}
+
+export const conversations = {
+  list(): Promise<ConversationListResponse> {
+    return request<ConversationListResponse>('GET', `${BASE}/conversations`);
+  },
+
+  create(): Promise<ConversationSummary> {
+    return request<ConversationSummary>('POST', `${BASE}/conversations`, {});
+  },
+
+  history(id: string): Promise<MessageHistoryResponse> {
+    return request<MessageHistoryResponse>(
+      'GET',
+      `${BASE}/conversations/${id}/messages`,
+    );
+  },
+};
+
 // ─── Inbox ───────────────────────────────────────────────────────────────────
 
 export interface InboxItem {
