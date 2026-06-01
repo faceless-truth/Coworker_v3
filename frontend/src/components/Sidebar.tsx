@@ -16,7 +16,7 @@ const NAV = [
   { label: 'Knowledge Graph', path: '/knowledge-graph', icon: Network,         status: 'soon' as const },
   { label: 'Activity',        path: '/activity',        icon: Activity,        status: 'soon' as const },
   { label: 'Findings',        path: '/findings',        icon: Lightbulb,       status: 'soon' as const },
-  { label: 'Chat',            path: '/chat',            icon: MessageSquare,   status: 'soon' as const },
+  { label: 'Chat',            path: '/chat',            icon: MessageSquare,   status: 'live' as const },
   { label: 'Specialists',     path: '/specialists',     icon: Users,           status: 'live' as const },
   { label: 'Settings',        path: '/settings',        icon: Settings,        status: 'soon' as const },
 ]
