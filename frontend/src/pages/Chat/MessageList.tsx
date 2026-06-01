@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
+import rehypeRaw from 'rehype-raw'
 import remarkGfm from 'remark-gfm'
 import type { Components } from 'react-markdown'
 import type { ChatMessageOut } from '../../api/client'
@@ -46,11 +47,42 @@ const MD_COMPONENTS: Components = {
       {children}
     </pre>
   ),
+  details: ({ children, ...rest }) => (
+    <details
+      {...rest}
+      style={{
+        margin: '8px 0',
+        padding: '8px 12px',
+        border: '1px solid #d9d8d8',
+        borderRadius: '4px',
+        background: '#ffffff',
+      }}
+    >
+      {children}
+    </details>
+  ),
+  summary: ({ children, ...rest }) => (
+    <summary
+      {...rest}
+      style={{
+        cursor: 'pointer',
+        fontWeight: 500,
+        color: '#142234',
+        userSelect: 'none',
+      }}
+    >
+      {children}
+    </summary>
+  ),
 }
 
 function Markdown({ children }: { children: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={MD_COMPONENTS}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw]}
+      components={MD_COMPONENTS}
+    >
       {children}
     </ReactMarkdown>
   )

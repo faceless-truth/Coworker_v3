@@ -4,9 +4,15 @@ The orchestrator (Sonnet 4.6) drives a tool-use loop. On each round it
 streams a response that may contain text and zero or more
 ``consult_specialist`` tool calls. For each tool call the orchestrator
 opens a specialist consultation (Opus, the specialist's active prompt
-as system), streams the specialist's answer directly to the user, then
-hands the specialist's text back to Sonnet as a ``tool_result`` and
-loops. The turn ends when Sonnet returns ``stop_reason="end_turn"``.
+as system) and captures the full output server-side. Specialist
+tokens are NOT streamed to the user; the user sees consultation
+started/complete badges only. After all consultations complete, the
+orchestrator's continuation turn synthesises the specialist findings
+into a brief, scannable summary which IS streamed. The persisted
+``chat_messages.content`` is then the synthesis followed by one
+``<details>``/``<summary>`` collapsible per consultation containing
+the full verbatim specialist output. The turn ends when Sonnet
+returns ``stop_reason="end_turn"``.
 
 Every chat turn writes one ``agent_traces`` row via
 ``AgentTraceWriter``. The orchestrator's Sonnet calls land as
@@ -56,24 +62,47 @@ from coworker.orchestrator.trace import AgentTraceWriter
 ORCHESTRATOR_SYSTEM_PROMPT = (
     "You are CoWorker, an AI assistant for an Australian accounting "
     "practice (MC & S Pty Ltd, Melbourne).\n\n"
-    "For substantive tax or compliance questions, consult a specialist "
-    "using the consult_specialist tool. The specialist's full answer is "
-    "shown directly to the user, so you do not need to restate or "
-    "summarise it. Your role is to:\n"
-    "1. Briefly frame the consultation (e.g. 'Let me check with the "
-    "GST Specialist...') before calling the tool.\n"
-    "2. Call consult_specialist with a focused, well-scoped question "
-    "reformulated from the user's input.\n"
-    "3. If the question spans multiple specialist domains, consult "
-    "each relevant specialist (call the tool multiple times in one "
-    "turn).\n"
-    "4. After all consultations, you may briefly synthesise across them "
-    "if more than one was consulted. Otherwise, end your turn.\n\n"
-    "For simple non-substantive questions (definitions, terminology, "
-    "general clarifications), answer directly without consulting a "
-    "specialist.\n\n"
-    "Be concise. Australian English. Cite the narrowest useful "
-    "statutory provision when discussing law. No em dashes (house style)."
+    "For substantive tax or compliance questions, consult the relevant "
+    "specialists using the consult_specialist tool. After consultations "
+    "complete, your job is to SYNTHESISE the specialist findings into a "
+    "brief, scannable summary for the user.\n\n"
+    "Synthesis discipline:\n"
+    "1. Open with a one-sentence framing that names the domains "
+    "covered (e.g. 'GST, CGT and Division 7A all apply to this "
+    "structure.').\n"
+    "2. Provide a short, scannable summary organised by issue or by "
+    "specialist. Aim for 150 to 400 words. Use bullet points or short "
+    "paragraphs.\n"
+    "3. Cover only the most important findings: the key statutory "
+    "provisions, the highest-impact action items, and any cross-domain "
+    "interactions the specialists identified.\n"
+    "4. Do NOT restate the specialists' full analyses. The user can "
+    "expand collapsible sections to see the full verbatim output. "
+    "Trust that the full text is one click away.\n"
+    "5. Where specialists disagree or where multiple paths exist, "
+    "briefly note the tradeoff.\n"
+    "6. If any consultation failed (you saw a tool_result indicating "
+    "failure), briefly acknowledge it in your synthesis (e.g. 'The "
+    "Div7A consultation was unavailable; the analysis above relies on "
+    "GST and CGT only.'). The user can expand the failed specialist's "
+    "collapsible below to see what went wrong.\n"
+    "7. End with 'Click any specialist below to see the full analysis.' "
+    "if at least one consultation occurred.\n\n"
+    "When NOT consulting specialists (simple questions, definitions, "
+    "clarifications), answer directly and concisely.\n\n"
+    "Style notes:\n"
+    "- Australian English.\n"
+    "- Narrowest useful provision citations (e.g. 'ITAA 1997 s 152-10' "
+    "not 'Division 152').\n"
+    "- No em dashes (house style).\n"
+    "- No 'Let me check with...' preambles when calling tools. The "
+    "user sees badges indicating consultation in progress; you do not "
+    "need to narrate.\n\n"
+    "Tone:\n"
+    "You are talking to a qualified Australian accountant. Be "
+    "respectful of their time. They want to orient quickly, not read "
+    "a memo. They will dig into the full specialist output if they "
+    "want depth."
 )
 
 _SPECIALIST_NAMES: list[str] = [
@@ -140,6 +169,66 @@ def _sse(event: str, data: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+_CONSULTATIONS_START_MARKER = "<!-- specialist-consultations-start -->"
+_CONSULTATIONS_END_MARKER = "<!-- specialist-consultations-end -->"
+
+
+def _assemble_assistant_content(
+    synthesis_text: str,
+    completed_consultations: list[dict[str, Any]],
+) -> str:
+    """Combine the orchestrator's synthesis with one ``<details>``
+    collapsible per consultation.
+
+    Consultations appear in the order they completed. Successful
+    consultations carry the specialist's full verbatim text. Failed
+    consultations carry the error message and any partial text that
+    streamed before the failure. Markers around the collapsibles
+    bracket the region so existing chat history (no markers) renders
+    unchanged.
+    """
+    if not completed_consultations:
+        return synthesis_text
+
+    parts: list[str] = [synthesis_text.rstrip(), "", _CONSULTATIONS_START_MARKER, ""]
+    for c in completed_consultations:
+        version_id = c.get("prompt_version_id")
+        version_label = (
+            f"prompt v{version_id[:8]}"
+            if isinstance(version_id, str) and version_id
+            else "prompt version unknown"
+        )
+        model_label = c.get("model") or "model unknown"
+        display_name = c["display_name"]
+
+        if c["status"] == "ok":
+            summary_label = (
+                f"{display_name} — full analysis "
+                f"({version_label}, {model_label})"
+            )
+            body = c["full_text"]
+        else:
+            summary_label = (
+                f"{display_name} — consultation FAILED "
+                f"({version_label}, {model_label})"
+            )
+            body_lines = [c.get("error", "Unknown error")]
+            partial = c.get("partial_text") or ""
+            if partial:
+                body_lines.extend(["", partial])
+            body = "\n".join(body_lines)
+
+        parts.append("<details>")
+        parts.append(f"<summary>{summary_label}</summary>")
+        parts.append("")
+        parts.append(body)
+        parts.append("")
+        parts.append("</details>")
+        parts.append("")
+    parts.append(_CONSULTATIONS_END_MARKER)
+    return "\n".join(parts)
+
+
 async def stream_chat(
     session: AsyncSession,
     *,
@@ -197,6 +286,7 @@ async def stream_chat(
     ]
 
     displayed_full_text_parts: list[str] = []
+    completed_consultations: list[dict[str, Any]] = []
     total_input_tokens = 0
     total_output_tokens = 0
     final_error: str | None = None
@@ -322,6 +412,7 @@ async def stream_chat(
                 consultation_input_tokens = 0
                 consultation_output_tokens = 0
                 consultation_started_emitted = False
+                consultation_display_name = ""
 
                 async for cev in consult_specialist(
                     session,
@@ -333,6 +424,7 @@ async def stream_chat(
                         consultation_started_emitted = True
                         consultation_prompt_version_id = cev.prompt_version_id
                         consultation_model = cev.model
+                        consultation_display_name = cev.display_name
                         yield _sse(
                             "specialist_consultation_started",
                             {
@@ -346,15 +438,13 @@ async def stream_chat(
                             },
                         )
                     elif isinstance(cev, ConsultationTextDelta):
-                        yield _sse(
-                            "token",
-                            {
-                                "text": cev.text,
-                                "source": (
-                                    f"specialist:{cev.specialist_name}"
-                                ),
-                            },
-                        )
+                        # Specialist tokens are no longer streamed to
+                        # the user; the orchestrator's post-consultation
+                        # synthesis is what the user reads. Full
+                        # specialist text is collected here and surfaced
+                        # via a <details> collapsible appended to
+                        # chat_messages.content after the stream ends.
+                        consultation_full_text += cev.text
                     elif isinstance(cev, ConsultationComplete):
                         consultation_full_text = cev.full_text
                         consultation_input_tokens = cev.input_tokens
@@ -393,11 +483,43 @@ async def stream_chat(
                     (time.perf_counter() - consultation_start) * 1000
                 )
 
-                if consultation_full_text:
-                    displayed_full_text_parts.append(consultation_full_text)
-                elif consultation_partial_text:
-                    displayed_full_text_parts.append(
-                        consultation_partial_text
+                # Capture each consultation for the post-stream
+                # assembly of chat_messages.content as a <details>
+                # collapsible. Successes carry the full text;
+                # failures carry the error and any partial text.
+                collapsible_display_name = (
+                    consultation_display_name or specialist_name or "Specialist"
+                )
+                if consultation_error is None:
+                    completed_consultations.append(
+                        {
+                            "status": "ok",
+                            "specialist_name": specialist_name,
+                            "display_name": collapsible_display_name,
+                            "prompt_version_id": (
+                                str(consultation_prompt_version_id)
+                                if consultation_prompt_version_id is not None
+                                else None
+                            ),
+                            "model": consultation_model,
+                            "full_text": consultation_full_text,
+                        }
+                    )
+                else:
+                    completed_consultations.append(
+                        {
+                            "status": "failed",
+                            "specialist_name": specialist_name,
+                            "display_name": collapsible_display_name,
+                            "prompt_version_id": (
+                                str(consultation_prompt_version_id)
+                                if consultation_prompt_version_id is not None
+                                else None
+                            ),
+                            "model": consultation_model,
+                            "error": consultation_error,
+                            "partial_text": consultation_partial_text,
+                        }
                     )
 
                 tool_result_text = (
@@ -485,7 +607,10 @@ async def stream_chat(
         completion_reason=final_completion_reason,
     )
 
-    assistant_content = "".join(displayed_full_text_parts)
+    synthesis_text = "".join(displayed_full_text_parts)
+    assistant_content = _assemble_assistant_content(
+        synthesis_text, completed_consultations
+    )
     assistant_msg = ChatMessage(
         conversation_id=conversation_id,
         firm_id=firm_id,

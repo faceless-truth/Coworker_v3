@@ -14,8 +14,10 @@ scripted ``AnthropicClient`` double. Covers the v2 surface:
   error tool_result instead of crashing).
 - Cross-firm isolation: firm B's user cannot trigger consultations
   of firm A's specialists.
-- chat_messages.content carries the full displayed text in arrival
-  order across all sources.
+- chat_messages.content carries the orchestrator's synthesis text
+  followed by one <details> collapsible per consultation (full
+  verbatim specialist text inside, hidden by default in the UI).
+  Failed consultations render a collapsible flagged FAILED.
 - agent_trace_steps for consultations record
   ``specialist_prompt_version_id`` in ``content``.
 - Threading: prior turns are passed back in conversation history.
@@ -492,18 +494,18 @@ async def test_orchestrator_one_specialist_consultation(orch_env):
     assert "specialist_consultation_started" in joined
     assert "specialist_consultation_complete" in joined
     assert '"source": "orchestrator"' in joined
-    assert '"source": "specialist:gst"' in joined
+    # Specialist tokens are NOT streamed to the user post 003d-summary.
+    assert '"source": "specialist:gst"' not in joined
     assert "event: done" in joined
     assert "event: error" not in joined
 
-    # SSE order: orch token(s) → specialist_started → specialist
-    # token(s) → specialist_complete → done.
+    # SSE order: orch token(s) → specialist_started → specialist_complete
+    # → done. No specialist tokens between started and complete.
     idx_orch_token = joined.index('"source": "orchestrator"')
     idx_started = joined.index("specialist_consultation_started")
-    idx_spec_token = joined.index('"source": "specialist:gst"')
     idx_complete = joined.index("specialist_consultation_complete")
     idx_done = joined.index("event: done")
-    assert idx_orch_token < idx_started < idx_spec_token < idx_complete < idx_done
+    assert idx_orch_token < idx_started < idx_complete < idx_done
 
     async with sm() as session, firm_context(firm_id):
         msgs = (
@@ -549,13 +551,21 @@ async def test_orchestrator_one_specialist_consultation(orch_env):
     assert tr.content["specialist_name"] == "gst"
     assert tr.content["specialist_prompt_version_id"] == str(version_id)
 
-    # Assistant message: displayed text = orch round 1 text + specialist
-    # answer + orch round 2 text (empty here).
-    assert (
-        msgs[1].content
-        == "Let me check with the GST Specialist."
-        + "Going concern sale is GST-free under s 38-325."
-    )
+    # Assistant message: synthesis = orch round 1 + orch round 2 text;
+    # specialist answer is wrapped in a <details> collapsible below
+    # the consultations-start marker. The synthesis itself must NOT
+    # contain the specialist text.
+    content = msgs[1].content
+    assert content.startswith("Let me check with the GST Specialist.")
+    assert "<!-- specialist-consultations-start -->" in content
+    assert "<!-- specialist-consultations-end -->" in content
+    assert "<details>" in content
+    assert "<summary>GST Specialist — full analysis" in content
+    assert "Going concern sale is GST-free under s 38-325." in content
+    synthesis = content.split(
+        "<!-- specialist-consultations-start -->", 1
+    )[0]
+    assert "Going concern sale" not in synthesis
     assert msgs[1].trace_id == trace.id
 
 
@@ -624,8 +634,9 @@ async def test_orchestrator_multiple_specialist_consultations(orch_env):
     joined = "".join(sse_chunks)
     assert joined.count("specialist_consultation_started") == 2
     assert joined.count("specialist_consultation_complete") == 2
-    assert '"source": "specialist:gst"' in joined
-    assert '"source": "specialist:smsf"' in joined
+    # Specialist tokens are NOT streamed to the user post 003d-summary.
+    assert '"source": "specialist:gst"' not in joined
+    assert '"source": "specialist:smsf"' not in joined
 
     async with sm() as session, firm_context(firm_id):
         steps = (
@@ -653,13 +664,25 @@ async def test_orchestrator_multiple_specialist_consultations(orch_env):
     assert steps[2].content["specialist_name"] == "gst"
     assert steps[4].content["specialist_name"] == "smsf"
 
-    # Displayed text aggregates in order.
-    assert msgs[1].content == (
-        "Two domains here."
-        + "GST answer."
-        + "SMSF answer."
-        + "In short: see both above."
+    # Synthesis = orch round 1 + orch round 2; two collapsibles below,
+    # in invocation order (GST then SMSF). Specialist text appears
+    # only inside the collapsibles, never in the synthesis.
+    content = msgs[1].content
+    assert content.startswith("Two domains here.")
+    assert "In short: see both above." in content
+    assert content.count("<details>") == 2
+    assert "<summary>GST — full analysis" in content
+    assert "<summary>SMSF — full analysis" in content
+    assert content.index("GST — full analysis") < content.index(
+        "SMSF — full analysis"
     )
+    assert "GST answer." in content
+    assert "SMSF answer." in content
+    synthesis = content.split(
+        "<!-- specialist-consultations-start -->", 1
+    )[0]
+    assert "GST answer." not in synthesis
+    assert "SMSF answer." not in synthesis
 
 
 @pytest.mark.asyncio
@@ -720,6 +743,13 @@ async def test_orchestrator_specialist_not_found(orch_env):
                 select(AgentTraceStep).order_by(AgentTraceStep.step_index.asc())
             )
         ).scalars().all()
+        msgs = (
+            await session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv_id)
+                .order_by(ChatMessage.created_at.asc())
+            )
+        ).scalars().all()
 
     assert [s.step_type for s in steps] == [
         "model_call",
@@ -732,6 +762,15 @@ async def test_orchestrator_specialist_not_found(orch_env):
     assert "not registered" in tr.content["result"]
     # No prompt_version_id captured since the specialist wasn't found.
     assert "specialist_prompt_version_id" not in tr.content
+
+    # Persisted assistant content includes a FAILED collapsible for
+    # the missing specialist (display_name falls back to specialist
+    # slug since ConsultationStarted was never emitted).
+    content = msgs[1].content
+    assert "<!-- specialist-consultations-start -->" in content
+    assert content.count("<details>") == 1
+    assert "consultation FAILED" in content
+    assert "not registered" in content
 
 
 @pytest.mark.asyncio
@@ -923,3 +962,146 @@ async def test_orchestrator_persists_partial_on_stream_error(orch_env):
     assert "ConnectorTransient" in msgs[1].error
     assert traces[0].status == "failed"
     assert traces[0].completion_reason == "connector_error"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_failed_consultation_renders_collapsible(orch_env):
+    """A consultation that emits ConsultationStarted then raises
+    mid-stream should produce a <details> block flagged FAILED in
+    the persisted assistant content, with the error message and any
+    partial text inside. The orchestrator continues to its next round
+    after the failure."""
+    sm = orch_env["sm"]
+    firm_id = orch_env["firm_id"]
+    conv_id = orch_env["conv_id"]
+
+    await _seed_specialist(sm, firm_id, name="gst", display_name="GST")
+
+    fake = _ScriptedAnthropicClient(
+        orchestrator_rounds=[
+            OrchRoundScript(
+                text_chunks=["Trying GST."],
+                tool_uses=[
+                    {
+                        "id": "tu_gst",
+                        "name": "consult_specialist",
+                        "input": {
+                            "specialist_name": "gst",
+                            "question": "?",
+                        },
+                    }
+                ],
+                stop_reason="tool_use",
+            ),
+            OrchRoundScript(
+                text_chunks=["Sorry, the GST analysis is unavailable."],
+                stop_reason="end_turn",
+            ),
+        ],
+        specialist_responses=[
+            ConnectorTransient("simulated specialist blip"),
+        ],
+    )
+
+    async with sm() as session, firm_context(firm_id):
+        sse_chunks = await _drain(
+            stream_chat(
+                session,
+                conversation_id=conv_id,
+                user_content="GST?",
+                firm_id=firm_id,
+                client=fake,
+            )
+        )
+
+    joined = "".join(sse_chunks)
+    assert "specialist_consultation_started" in joined
+    assert "specialist_consultation_error" in joined
+    assert "specialist_consultation_complete" not in joined
+    assert '"source": "specialist:gst"' not in joined
+    assert "event: done" in joined
+
+    async with sm() as session, firm_context(firm_id):
+        msgs = (
+            await session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv_id)
+                .order_by(ChatMessage.created_at.asc())
+            )
+        ).scalars().all()
+
+    content = msgs[1].content
+    assert content.startswith("Trying GST.")
+    assert "Sorry, the GST analysis is unavailable." in content
+    assert "<!-- specialist-consultations-start -->" in content
+    assert "<!-- specialist-consultations-end -->" in content
+    assert content.count("<details>") == 1
+    assert "<summary>GST — consultation FAILED" in content
+    assert "ConnectorTransient" in content
+
+
+@pytest.mark.asyncio
+async def test_specialist_text_not_in_synthesis(orch_env):
+    """Sanity check that the orchestrator's synthesis region (text
+    above <!-- specialist-consultations-start -->) only contains
+    orchestrator-source content; specialist text appears exclusively
+    inside the <details> collapsibles below the marker."""
+    sm = orch_env["sm"]
+    firm_id = orch_env["firm_id"]
+    conv_id = orch_env["conv_id"]
+
+    await _seed_specialist(sm, firm_id, name="gst", display_name="GST")
+
+    sentinel = "SPECIALIST_ONLY_SENTINEL_42"
+    fake = _ScriptedAnthropicClient(
+        orchestrator_rounds=[
+            OrchRoundScript(
+                text_chunks=["Orchestrator framing."],
+                tool_uses=[
+                    {
+                        "id": "tu_gst",
+                        "name": "consult_specialist",
+                        "input": {
+                            "specialist_name": "gst",
+                            "question": "?",
+                        },
+                    }
+                ],
+                stop_reason="tool_use",
+            ),
+            OrchRoundScript(
+                text_chunks=["Orchestrator synthesis."],
+                stop_reason="end_turn",
+            ),
+        ],
+        specialist_responses=[
+            SpecResponse(text_chunks=[sentinel]),
+        ],
+    )
+
+    async with sm() as session, firm_context(firm_id):
+        await _drain(
+            stream_chat(
+                session,
+                conversation_id=conv_id,
+                user_content="?",
+                firm_id=firm_id,
+                client=fake,
+            )
+        )
+        msgs = (
+            await session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.conversation_id == conv_id)
+                .order_by(ChatMessage.created_at.asc())
+            )
+        ).scalars().all()
+
+    content = msgs[1].content
+    synthesis, _, rest = content.partition(
+        "<!-- specialist-consultations-start -->"
+    )
+    assert "Orchestrator framing." in synthesis
+    assert "Orchestrator synthesis." in synthesis
+    assert sentinel not in synthesis
+    assert sentinel in rest

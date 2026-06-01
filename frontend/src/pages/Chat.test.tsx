@@ -167,7 +167,10 @@ describe('Chat page', () => {
           model: 'claude-opus-4-7',
           step_index: 2,
         },
-        { type: 'token', text: 'GST applies.', source: 'specialist:gst' },
+        // Post 003d-summary: specialist tokens are no longer streamed.
+        // The user sees the badge only; the full specialist text
+        // arrives as a <details> collapsible in the persisted message
+        // after history refetch.
         {
           type: 'specialist_consultation_complete',
           specialist_name: 'gst',
@@ -175,6 +178,7 @@ describe('Chat page', () => {
           output_tokens: 120,
           step_index: 2,
         },
+        { type: 'token', text: 'GST applies.', source: 'orchestrator' },
         {
           type: 'done',
           message_id: 'm-asst',
@@ -312,5 +316,98 @@ describe('Chat page', () => {
         screen.getByText(/connectorerror: anthropic 503/i),
       ).toBeInTheDocument(),
     )
+  })
+
+  it('renders persisted assistant message with collapsible specialist sections', async () => {
+    listMock.mockResolvedValue({
+      conversations: [makeConv('c-existing', '2026-06-01T11:00:00Z')],
+    })
+    historyMock.mockResolvedValue({
+      messages: [
+        {
+          id: 'm-user',
+          role: 'user',
+          content: 'Pharmacy GST and CGT?',
+          model: null,
+          input_tokens: null,
+          output_tokens: null,
+          error: null,
+          created_at: '2026-06-01T11:00:00Z',
+        },
+        {
+          id: 'm-asst',
+          role: 'assistant',
+          content: [
+            'GST and CGT both apply to this structure.',
+            '',
+            '- GST: going concern exemption available (s 38-325).',
+            '- CGT: small business concessions in Division 152.',
+            '',
+            'Click any specialist below to see the full analysis.',
+            '',
+            '<!-- specialist-consultations-start -->',
+            '',
+            '<details>',
+            '<summary>GST Specialist — full analysis (prompt v12345678, claude-opus-4-7)</summary>',
+            '',
+            'Full GST verbatim text that is hidden by default.',
+            '',
+            '</details>',
+            '',
+            '<details>',
+            '<summary>CGT Specialist — full analysis (prompt v87654321, claude-opus-4-7)</summary>',
+            '',
+            'Full CGT verbatim text that is hidden by default.',
+            '',
+            '</details>',
+            '',
+            '<!-- specialist-consultations-end -->',
+          ].join('\n'),
+          model: 'claude-sonnet-4-6',
+          input_tokens: 100,
+          output_tokens: 250,
+          error: null,
+          created_at: '2026-06-01T11:00:01Z',
+        },
+      ],
+    })
+
+    render(<Chat />)
+
+    // Select the existing conversation from the sidebar.
+    const convButton = await screen.findByRole('button', {
+      name: /pharmacy gst and cgt|untitled/i,
+    })
+    await userEvent.click(convButton)
+
+    // Synthesis is visible immediately.
+    await screen.findByText(/gst and cgt both apply to this structure\./i)
+    expect(
+      screen.getByText(/click any specialist below to see the full analysis\./i),
+    ).toBeInTheDocument()
+
+    // Two <details> elements render, both closed by default.
+    const detailsElements = document.querySelectorAll('details')
+    expect(detailsElements.length).toBe(2)
+    for (const d of detailsElements) {
+      expect((d as HTMLDetailsElement).open).toBe(false)
+    }
+
+    // Summary labels are visible.
+    expect(
+      screen.getByText(/gst specialist — full analysis/i),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(/cgt specialist — full analysis/i),
+    ).toBeInTheDocument()
+
+    // Full verbatim text is in the DOM (inside the closed details) but
+    // not visually exposed (details default state hides children).
+    expect(
+      screen.getByText(/full gst verbatim text that is hidden by default\./i),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText(/full cgt verbatim text that is hidden by default\./i),
+    ).toBeInTheDocument()
   })
 })
