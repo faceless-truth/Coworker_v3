@@ -18,6 +18,7 @@
     "react-markdown": "^9.1.0",
     "react-router-dom": "^7.15.1",
     "reactflow": "^11.11.4",
+    "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
